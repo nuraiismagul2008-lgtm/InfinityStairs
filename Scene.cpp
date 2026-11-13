@@ -818,6 +818,10 @@ float playerX, playerZ, feetY, cameraY;
 float yaw, pitch;
 float fieldOfView = 70.0f;
 float totalDescent = 0.0f;   // meters the player gone down - doesnt reset with loop
+bool depthEventTriggered = false;
+float depthEventTimer = 0.0f;
+bool redLightEventTriggered = false;
+float redLightEventTimer = 0.0f;
 int wrapCount = 0;           // times player moved back by the loop
 bool flashlightOn = true;
 bool useTexture = true;
@@ -1007,7 +1011,9 @@ void drawFloors(GLuint program, int baseFloor, bool setGlow)
 
 
 // Takes the nearest lamps from the drawn floors and gives their data to the shader (positions in the eye coordinates)
-int selectLamps(int baseFloor, Vec3 eye, const float* view, float* positions, float* colors, float* levels)
+int selectLamps(int baseFloor, Vec3 eye, const float* view,
+	float* positions, float* colors, float* levels,
+	float coldLightFactor, float redLightFactor)
 {
 	int ids[16];
 	float distances[16];
@@ -1036,10 +1042,21 @@ int selectLamps(int baseFloor, Vec3 eye, const float* view, float* positions, fl
 		positions[count * 3] = p.x;
 		positions[count * 3 + 1] = p.y;
 		positions[count * 3 + 2] = p.z;
-		colors[count * 3] = lamp.color[0];
-		colors[count * 3 + 1] = lamp.color[1];
-		colors[count * 3 + 2] = lamp.color[2];
-		levels[count] = lamp.level;
+		// Blend the original lamp color with a cold blue tint or with a red tint
+		const float coldColor[3] = { 0.55f, 0.72f, 1.0f };
+		const float redColor[3] = { 1.0f, 0.08f, 0.03f };
+
+		for (int c = 0; c < 3; c++)
+		{
+			float normalColor =
+				lamp.color[c] * (1.0f - coldLightFactor) +
+				coldColor[c] * coldLightFactor;
+
+			colors[count * 3 + c] =
+				normalColor * (1.0f - redLightFactor) +
+				redColor[c] * redLightFactor;
+		}
+		levels[count] = (depthEventTimer > 0.0f) ? 0.0f : lamp.level;
 		count++;
 		ids[best] = ids[n - 1];
 		distances[best] = distances[n - 1];
@@ -1136,6 +1153,7 @@ int main(int argc, char** argv)
 
 	// Fog color in the linear space, the clear color is the same, but in the sRGB space
 	const float fogColor[3] = { 0.004f, 0.005f, 0.007f };
+	float depthFogFactor = 0.0f;
 	float clearColor[3];
 	for (int i = 0; i < 3; i++)
 	{
@@ -1178,6 +1196,61 @@ int main(int argc, char** argv)
 			updateLamp(lamps[i], seconds);
 		}
 		updateLamp(flashlight, seconds);
+
+		// Depth-based lighting event
+		if (!depthEventTriggered && totalDescent >= 15.0f)
+		{
+			depthEventTriggered = true;
+			depthEventTimer = 2.0f;
+		}
+
+		// Emergency red light event
+		if (!redLightEventTriggered && totalDescent >= 45.0f)
+		{
+			redLightEventTriggered = true;
+			redLightEventTimer = 4.0f;
+		}
+
+		if (redLightEventTimer > 0.0f)
+		{
+			redLightEventTimer -= seconds;
+
+			if (redLightEventTimer < 0.0f)
+			{
+				redLightEventTimer = 0.0f;
+			}
+		}
+
+		if (depthEventTimer > 0.0f)
+		{
+			depthEventTimer -= seconds;
+			if (depthEventTimer < 0.0f)
+			{
+				depthEventTimer = 0.0f;
+			}
+		}
+
+		// Depth-based fog intensity
+		depthFogFactor = clampValue(
+			(totalDescent - 20.0f) / 20.0f,
+			0.0f,
+			1.0f
+		);
+
+		// Depth-based cold lighting
+		float coldLightFactor = clampValue(
+			(totalDescent - 35.0f) / 15.0f,
+			0.0f,
+			1.0f
+		);
+
+		// Emergency red light pulse
+		float redLightFactor = 0.0f;
+
+		if (redLightEventTimer > 0.0f)
+		{
+			redLightFactor = 0.65f + 0.20f * sinf(currentTime * 10.0f);
+		}
 
 		// camera
 		Vec3 eye = makeVec(playerX, cameraY, playerZ);
@@ -1248,8 +1321,19 @@ int main(int argc, char** argv)
 		glUniform1i(glGetUniformLocation(sceneProgram, "uUseShadow"), shadowActive ? 1 : 0);
 		glUniform1i(glGetUniformLocation(sceneProgram, "uUseFog"), useFog ? 1 : 0);
 		glUniform1f(glGetUniformLocation(sceneProgram, "uShadowBias"), 0.0004f);
-		glUniform1f(glGetUniformLocation(sceneProgram, "uFogDensity"), 0.10f);
-		glUniform3fv(glGetUniformLocation(sceneProgram, "uFogColor"), 1, fogColor);
+		
+		// Depth-based fog
+		float currentFogDensity = 0.20f + 0.15f * depthFogFactor;
+
+		float currentFogColor[3] =
+		{
+			fogColor[0] + 0.015f * depthFogFactor,
+			fogColor[1] + 0.025f * depthFogFactor,
+			fogColor[2] + 0.055f * depthFogFactor
+		};
+
+		glUniform1f(glGetUniformLocation(sceneProgram, "uFogDensity"), currentFogDensity);
+		glUniform3fv(glGetUniformLocation(sceneProgram, "uFogColor"), 1, currentFogColor);
 
 		// Flashlight: in the eye coordinates the camera is at (0, 0, 0) and looks to -z
 		glUniform1i(glGetUniformLocation(sceneProgram, "uFlashlightOn"), flashlightOn ? 1 : 0);
@@ -1263,7 +1347,11 @@ int main(int argc, char** argv)
 		float lampPositions[MAX_LAMPS * 3];
 		float lampColors[MAX_LAMPS * 3];
 		float lampLevels[MAX_LAMPS];
-		int lampCount = selectLamps(baseFloor, eye, view, lampPositions, lampColors, lampLevels);
+		int lampCount = selectLamps(
+			baseFloor, eye, view,
+			lampPositions, lampColors, lampLevels,
+			coldLightFactor, redLightFactor
+		);
 		glUniform1i(glGetUniformLocation(sceneProgram, "uLampCount"), lampCount);
 		if (lampCount > 0)
 		{
