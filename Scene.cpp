@@ -11,6 +11,12 @@
 #include <ctime>
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <Windows.h>
+#include <mmsystem.h>
+
+#pragma comment(lib, "Winmm.lib")
 
 const float PI = 3.14159265f;
 
@@ -435,7 +441,186 @@ GLuint createTexture(const std::vector<unsigned char>& pixels)
 	return texture;
 }
 
+GLuint loadPNGTexture(const std::string& path)
+{
+	int width, height, channels;
+
+	stbi_set_flip_vertically_on_load(true);
+
+	unsigned char* image = stbi_load(
+		path.c_str(),
+		&width,
+		&height,
+		&channels,
+		STBI_rgb_alpha
+	);
+
+	if (!image)
+	{
+		std::cout << "Failed to load texture: "
+			<< path << std::endl;
+		return 0;
+	}
+
+	GLuint texture;
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+
+	glTexImage2D(
+		GL_TEXTURE_2D,
+		0,
+		GL_RGBA,
+		width,
+		height,
+		0,
+		GL_RGBA,
+		GL_UNSIGNED_BYTE,
+		image
+	);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+	stbi_image_free(image);
+
+	return texture;
+}
+
+void drawFace(
+	GLuint program,
+	GLuint vao,
+	GLuint vbo,
+	GLuint texture,
+	Vec3 eye,
+	Vec3 worldPosition,
+	const float* view,
+	const float* projection,
+	float width,
+	float height,
+	float alpha
+)
+
+{
+	Vec3 center = worldPosition;
+
+	Vec3 faceRight = makeVec(1.0f, 0.0f, 0.0f);
+	Vec3 faceUp = makeVec(0.0f, 1.0f, 0.0f);
+
+	Vec3 halfRight = scale(faceRight, width * 0.5f);
+	Vec3 halfUp = scale(faceUp, height * 0.5f);
+
+	Vec3 bottomLeft = add(add(center, scale(halfRight, -1.0f)), scale(halfUp, -1.0f));
+	Vec3 bottomRight = add(add(center, halfRight), scale(halfUp, -1.0f));
+	Vec3 topRight = add(add(center, halfRight), halfUp);
+	Vec3 topLeft = add(add(center, scale(halfRight, -1.0f)), halfUp);
+
+	float vertices[] =
+	{
+		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
+		bottomRight.x, bottomRight.y, bottomRight.z, 1.0f, 0.0f,
+		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
+
+		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
+		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
+		topLeft.x, topLeft.y, topLeft.z, 0.0f, 1.0f
+	};
+
+	glUseProgram(program);
+
+	glUniformMatrix4fv(
+		glGetUniformLocation(program, "uView"),
+		1, GL_FALSE, view
+	);
+
+	glUniformMatrix4fv(
+		glGetUniformLocation(program, "uProjection"),
+		1, GL_FALSE, projection
+	);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, texture);
+
+	glUniform1i(
+		glGetUniformLocation(program, "uFaceTexture"),
+		0
+	);
+
+	glUniform1f(
+		glGetUniformLocation(program, "uFaceAlpha"),
+		alpha
+	);
+
+	glBindVertexArray(vao);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+
+	glBufferSubData(
+		GL_ARRAY_BUFFER,
+		0,
+		sizeof(vertices),
+		vertices
+	);
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glDepthMask(GL_FALSE);
+
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+
+	glDepthMask(GL_TRUE);
+	glDisable(GL_BLEND);
+
+	glBindVertexArray(0);
+}
+
+void playHorrorSound()
+{
+	PlaySound(
+		TEXT("assets/audio/gloomy_demonic_drone.wav"),
+		NULL,
+		SND_FILENAME | SND_ASYNC | SND_NODEFAULT
+	);
+}
+
 // Shaders. All the lighting is calculated per fragment (Phong shading) in the camera (eye) coordinates
+
+const char* faceVertexShaderCode = R"GLSL(
+layout (location = 0) in vec3 vPosition;
+layout (location = 1) in vec2 vUV;
+
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+out vec2 fUV;
+
+void main()
+{
+    fUV = vUV;
+    gl_Position = uProjection * uView * vec4(vPosition, 1.0);
+}
+)GLSL";
+
+const char* faceFragmentShaderCode = R"GLSL(
+in vec2 fUV;
+out vec4 FragColor;
+
+uniform sampler2D uFaceTexture;
+
+uniform float uFaceAlpha;
+
+void main()
+{
+    vec4 face = texture(uFaceTexture, fUV);
+
+    if (face.a < 0.05)
+        discard;
+
+    face.a *= uFaceAlpha;
+	FragColor = face;
+}
+)GLSL";
 
 // Vertex Shader of the scene: model -> view -> projection, and the position in the light space for the shadow
 const char* sceneVertexShaderCode = R"GLSL(
@@ -503,6 +688,8 @@ uniform vec3 uGlowColor;
 
 uniform float uFogDensity;
 uniform vec3 uFogColor;
+
+uniform float uSceneBrightness;
 
 // Blinn-Phong: diffuse + specular with the halfway vector
 vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 specularColor, float shininess)
@@ -612,6 +799,9 @@ void main()
 		float fogAmount = exp(-x * x);
 		color = mix(uFogColor, color, fogAmount);
 	}
+
+	// Apply global scene brightness
+	color *= uSceneBrightness;
 
 	// Back to the sRGB space
 	color = pow(color, vec3(1.0 / 2.2));
@@ -822,6 +1012,27 @@ bool depthEventTriggered = false;
 float depthEventTimer = 0.0f;
 bool redLightEventTriggered = false;
 float redLightEventTimer = 0.0f;
+// SCP face event
+bool faceEventTriggered = false;
+float faceEventTimer = 0.0f;
+bool faceEventActive = false;
+bool horrorSoundTriggered = false;
+
+bool faceJumpScareActive = false;
+float faceJumpScareTimer = 0.0f;
+bool faceJumpScareTriggered = false;
+
+const float FACE_ATTACK_DURATION = 2.3f;
+
+Vec3 faceAttackStart;
+Vec3 faceAttackDirection;
+
+float faceAttackProgress = 0.0f;
+
+float faceWorldY = -51.0f;
+const float FACE_DEPTH = 51.0f;
+const float FACE_X = 0.0f;
+const float FACE_Z = HALF_Z - 0.05f;
 int wrapCount = 0;           // times player moved back by the loop
 bool flashlightOn = true;
 bool useTexture = true;
@@ -1119,6 +1330,10 @@ int main(int argc, char** argv)
 
 	GLuint sceneProgram = createShaderProgram(sceneVertexShaderCode, sceneFragmentShaderCode);
 	GLuint shadowProgram = createShaderProgram(shadowVertexShaderCode, shadowFragmentShaderCode);
+	GLuint faceProgram = createShaderProgram(
+		faceVertexShaderCode,
+		faceFragmentShaderCode
+	);
 
 	// Create the model of one floor, the VAO and the VBO
 	buildFloor();
@@ -1138,6 +1353,39 @@ int main(int argc, char** argv)
 	glEnableVertexAttribArray(2);
 	glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(8 * sizeof(float)));
 	glEnableVertexAttribArray(3);
+	// Face billboard geometry
+	GLuint faceVAO, faceVBO;
+
+	float faceVertices[30] = { 0.0f };
+
+	glGenVertexArrays(1, &faceVAO);
+	glGenBuffers(1, &faceVBO);
+
+	glBindVertexArray(faceVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, faceVBO);
+
+	glBufferData(
+		GL_ARRAY_BUFFER,
+		sizeof(faceVertices),
+		faceVertices,
+		GL_DYNAMIC_DRAW
+	);
+
+	// Position: 3 floats
+	glVertexAttribPointer(
+		0, 3, GL_FLOAT, GL_FALSE,
+		5 * sizeof(float), (void*)0
+	);
+	glEnableVertexAttribArray(0);
+
+	// Texture coordinates: 2 floats
+	glVertexAttribPointer(
+		1, 2, GL_FLOAT, GL_FALSE,
+		5 * sizeof(float), (void*)(3 * sizeof(float))
+	);
+	glEnableVertexAttribArray(1);
+
+	glBindVertexArray(0);
 
 	// The textures are made by the program, the shadow map is an empty depth texture
 	std::vector<unsigned char> pixels;
@@ -1147,6 +1395,9 @@ int main(int argc, char** argv)
 	GLuint metalTexture = createTexture(pixels);
 	GLuint shadowFramebuffer, shadowTexture;
 	createShadowMap(shadowFramebuffer, shadowTexture);
+	GLuint faceTexture = loadPNGTexture(
+		"assets/textures/scp_face.png"
+	);
 
 	initLamps();
 	resetPlayer();
@@ -1205,10 +1456,17 @@ int main(int argc, char** argv)
 		}
 
 		// Emergency red light event
-		if (!redLightEventTriggered && totalDescent >= 45.0f)
+		if (!redLightEventTriggered && totalDescent >= 48.0f)
 		{
 			redLightEventTriggered = true;
 			redLightEventTimer = 4.0f;
+		}
+
+		// SCP face event
+		if (!faceEventTriggered && totalDescent >= FACE_DEPTH)
+		{
+			faceEventTriggered = true;
+			faceEventActive = true;
 		}
 
 		if (redLightEventTimer > 0.0f)
@@ -1228,6 +1486,53 @@ int main(int argc, char** argv)
 			{
 				depthEventTimer = 0.0f;
 			}
+		}
+
+		if (faceEventTimer > 0.0f)
+		{
+			faceEventTimer -= seconds;
+
+			if (faceEventTimer <= 0.0f)
+			{
+				faceEventTimer = 0.0f;
+				faceEventActive = false;
+			}
+		}
+
+		// SCP face event brightness
+		float sceneBrightness = 1.0f;
+
+		if (faceEventActive)
+		{
+			if (faceEventTimer > 1.0f)
+			{
+				sceneBrightness = 0.05f;
+			}
+			else
+			{
+				sceneBrightness = 0.05f + 0.95f * (1.0f - faceEventTimer);
+			}
+		}
+
+		if (faceJumpScareActive)
+		{
+			float t = clampValue(faceAttackProgress, 0.0f, 1.0f);
+
+			if (t < 0.3f)
+			{
+				sceneBrightness = 1.0f - 0.90f * (t / 0.3f);
+			}
+			else
+			{
+				sceneBrightness = 0.10f;
+			}
+		}
+
+		// Horror sound starts at 50 meters
+		if (!horrorSoundTriggered && totalDescent >= 48.0f)
+		{
+			horrorSoundTriggered = true;
+			playHorrorSound();
 		}
 
 		// Depth-based fog intensity
@@ -1299,6 +1604,10 @@ int main(int argc, char** argv)
 		glClearColor(clearColor[0], clearColor[1], clearColor[2], 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glUseProgram(sceneProgram);
+		glUniform1f(
+			glGetUniformLocation(sceneProgram, "uSceneBrightness"),
+			sceneBrightness
+		);
 
 		// Matrices
 		glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uView"), 1, GL_FALSE, view);
@@ -1361,6 +1670,95 @@ int main(int argc, char** argv)
 		}
 
 		drawFloors(sceneProgram, baseFloor, true);
+
+		float faceAlpha = 1.0f;
+
+		float loopLength = LOOP_FLOORS * FLOOR_HEIGHT;
+
+		float faceLocalY = -FACE_DEPTH + wrapCount * loopLength;
+
+		Vec3 facePosition = makeVec(
+			FACE_X,
+			faceLocalY,
+			FACE_Z
+		);
+
+		Vec3 animatedFacePosition = facePosition;
+
+		float faceScale = 1.0f;
+
+		if (faceJumpScareActive)
+		{
+			float t = clampValue(faceAttackProgress, 0.0f, 1.0f);
+
+			animatedFacePosition = add(
+				faceAttackStart,
+				scale(faceAttackDirection, 3.0f * t)
+			);
+
+			faceScale = 1.0f + 1.5f * t;
+
+			if (t > 0.85f)
+			{
+				faceAlpha = 1.0f - (t - 0.85f) / 0.15f;
+			}
+		}
+
+		float distanceToFace = length(subtract(eye, facePosition));
+
+		if (!faceJumpScareTriggered &&
+			!faceJumpScareActive &&
+			faceEventTriggered &&
+			distanceToFace < 4.0f)
+		{
+			faceJumpScareTriggered = true;
+			faceJumpScareActive = true;
+			faceJumpScareTimer = FACE_ATTACK_DURATION;
+
+			faceAttackStart = facePosition;
+			faceAttackDirection = makeVec(0.0f, 0.0f, -1.0f);
+
+			faceAttackProgress = 0.0f;
+		}
+
+		if (faceJumpScareActive)
+		{
+			faceJumpScareTimer -= seconds;
+
+			faceAttackProgress =
+				1.0f - faceJumpScareTimer / FACE_ATTACK_DURATION;
+
+			if (faceJumpScareTimer <= 0.0f)
+			{
+				faceJumpScareTimer = 0.0f;
+				faceJumpScareActive = false;
+			}
+		}
+
+		if (faceTexture != 0 &&
+			faceEventTriggered &&
+			(!faceJumpScareTriggered || faceJumpScareActive))
+		{
+			glDisable(GL_DEPTH_TEST);
+			glDisable(GL_CULL_FACE);
+
+			drawFace(
+				faceProgram,
+				faceVAO,
+				faceVBO,
+				faceTexture,
+				eye,
+				animatedFacePosition,
+				view,
+				projection,
+				2.0f * faceScale,
+				2.4f * faceScale,
+				faceAlpha
+			);
+
+			glEnable(GL_CULL_FACE);
+			glEnable(GL_DEPTH_TEST);
+		}
 
 		// Swap the back buffer with the front buffer
 		glfwSwapBuffers(window);
