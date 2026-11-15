@@ -1,13 +1,7 @@
 // SCP-087 "Infinite Stairs" - Final Project
 // A real-time first-person demo of an endless dark stairwell. The player has only a flashlight.
 // Modern OpenGL 3.3 Core, GLFW + glad.
-//
-// Lighting, shadows and visibility part:
-//   - spotlight flashlight (cone, soft edge, cos^e shape, 1 / (a + b d + c d^2) attenuation, hand sway)
-//   - shadow mapping (depth texture in a frame buffer object, normal offset + bias, PCF 1x1 / 3x3 / 5x5)
-//   - fog: linear, exponential and Gaussian, thicker with the depth, light scattering in the fog
-//   - dust particles that are lit by the flashlight (particle system) and cast no light themselves
-//   - debug views of the shadows, the light and the fog, and the numbers about the performance
+
 
 #include <iostream>
 #include <vector>
@@ -20,6 +14,7 @@
 #include <GLFW/glfw3.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#include "stb_easy_font.h"   // simple font for the text on the screen
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -59,14 +54,6 @@ const int FLOORS_ABOVE = 2;
 const int FLOORS_BELOW = 3;
 const int MAX_LAMPS = 4;
 
-// Player
-const float EYE_HEIGHT = 1.65f;
-const float PLAYER_RADIUS = 0.25f;
-const float STEP_UP = 0.55f;
-const float WALK_SPEED = 2.2f;
-const float RUN_SPEED = 3.6f;
-const float MOUSE_SENSITIVITY = 0.1f;
-
 // Flashlight: it is held in the right hand, a bit lower than the eyes, so the shadows can be seen
 const float FLASH_OFFSET_X = 0.22f;
 const float FLASH_OFFSET_Y = -0.20f;
@@ -81,9 +68,15 @@ const int TEXTURE_SIZE = 256;
 const int DUST_COUNT = 900;
 const float DUST_RANGE_Y = 3.5f;         // the dust lives this far above and below the player
 
-// ---------------------------------------------------------------------------------------------
-// A simple 3D vector and the small functions that we need for it
-// ---------------------------------------------------------------------------------------------
+// Player
+const float EYE_HEIGHT = 1.65f;
+const float PLAYER_RADIUS = 0.25f;
+const float STEP_UP = 0.55f;
+const float WALK_SPEED = 2.2f;
+const float RUN_SPEED = 3.6f;
+const float MOUSE_SENSITIVITY = 0.1f;
+
+//3D vector and the small functions that we need for it
 struct Vec3 { float x, y, z; };
 
 Vec3 makeVec(float x, float y, float z)
@@ -151,9 +144,7 @@ float randomRange(float minValue, float maxValue)
 	return minValue + (maxValue - minValue) * randomFloat();
 }
 
-// ---------------------------------------------------------------------------------------------
 // Matrices are arrays of 16 floats, column by column, so OpenGL can use them directly
-// ---------------------------------------------------------------------------------------------
 void identityMatrix(float* m)
 {
 	for (int i = 0; i < 16; i++)
@@ -1280,9 +1271,8 @@ void initLamps()
 	initLamp(flashlight, true, 8.0f, 20.0f, FLASH_COLOR);
 }
 
-// ---------------------------------------------------------------------------------------------
+
 // Player, camera and the loop of the floors
-// ---------------------------------------------------------------------------------------------
 GLFWwindow* window;
 int windowWidth = 1280;
 int windowHeight = 720;
@@ -1317,6 +1307,15 @@ const float FACE_X = 0.0f;
 const float FACE_Z = HALF_Z - 0.05f;
 int wrapCount = 0;           // times player moved back by the loop
 bool useTexture = true;
+bool paused = false;         // Space: stops the animation, the mouse still turns the head
+bool helpVisible = false;    // F1: the keys on the screen
+bool freeFly = false;        // C: free camera, no collisions
+const float FLY_SPEED = 4.0f;
+const float GRAVITY = 14.0f;       // stronger than in real life, so the jump looks better
+const float JUMP_HEIGHT = 0.55f;   // in meters, small, so the head does not hit the stairs above
+bool jumpRequested = false;        // J: the key callback sets it, updatePlayer uses it once
+bool airborne = false;
+float verticalVelocity = 0.0f;
 bool firstMouse = true;
 double lastMouseX = 0.0;
 double lastMouseY = 0.0;
@@ -1341,6 +1340,9 @@ void resetPlayer()
 	totalDescent = 0.0f;
 	wrapCount = 0;
 	flashDirection = viewDirection();
+	freeFly = false;
+	airborne = false;
+	verticalVelocity = 0.0f;
 }
 
 bool canStand(float x, float z)
@@ -1389,32 +1391,96 @@ float groundHeight(float x, float z, float currentFeetY)
 
 void updatePlayer(float seconds)
 {
-	// The walking directions on the floor, the pitch is ignored
-	Vec3 forward = makeVec(sinf(yaw), 0.0f, -cosf(yaw));
-	Vec3 right = makeVec(cosf(yaw), 0.0f, sinf(yaw));
-	Vec3 wish = makeVec(0.0f, 0.0f, 0.0f);
-	if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wish = add(wish, forward);
-	if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wish = subtract(wish, forward);
-	if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wish = add(wish, right);
-	if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wish = subtract(wish, right);
-	wish = normalize(wish);
-	float speed = WALK_SPEED;
-	if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+	if (freeFly)
 	{
-		speed = RUN_SPEED;
+		// Free camera: the player flies where he looks, E goes up and Q goes down, Shift is faster
+		// There are no collisions, so we can look at the whole stairwell
+		Vec3 look = viewDirection();
+		Vec3 side = makeVec(cosf(yaw), 0.0f, sinf(yaw));
+		Vec3 fly = makeVec(0.0f, 0.0f, 0.0f);
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) fly = add(fly, look);
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) fly = subtract(fly, look);
+		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) fly = add(fly, side);
+		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) fly = subtract(fly, side);
+		if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) fly = add(fly, makeVec(0.0f, 1.0f, 0.0f));
+		if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) fly = subtract(fly, makeVec(0.0f, 1.0f, 0.0f));
+		fly = normalize(fly);
+		float flySpeed = FLY_SPEED;
+		if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+		{
+			flySpeed = FLY_SPEED * 3.0f;
+		}
+		playerX += fly.x * flySpeed * seconds;
+		playerZ += fly.z * flySpeed * seconds;
+		cameraY += fly.y * flySpeed * seconds;
+
+		airborne = false;
+		verticalVelocity = 0.0f;
+		jumpRequested = false;
+
+		// The feet stay under the camera, so the depth, fog and events still work
+		float oldFeetY = feetY;
+		feetY = cameraY - EYE_HEIGHT;
+		totalDescent += oldFeetY - feetY;
 	}
+	else
+	{
+		// The walking directions on the floor, the pitch is ignored
+		Vec3 forward = makeVec(sinf(yaw), 0.0f, -cosf(yaw));
+		Vec3 right = makeVec(cosf(yaw), 0.0f, sinf(yaw));
+		Vec3 wish = makeVec(0.0f, 0.0f, 0.0f);
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wish = add(wish, forward);
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wish = subtract(wish, forward);
+		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wish = add(wish, right);
+		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wish = subtract(wish, right);
+		wish = normalize(wish);
+		float speed = WALK_SPEED;
+		if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+		{
+			speed = RUN_SPEED;
+		}
 
-	// X and Z are tried separately, so the player slides along the walls
-	float newX = playerX + wish.x * speed * seconds;
-	if (canStand(newX, playerZ)) playerX = newX;
-	float newZ = playerZ + wish.z * speed * seconds;
-	if (canStand(playerX, newZ)) playerZ = newZ;
+		// X and Z are tried separately, so the player slides along the walls
+		float newX = playerX + wish.x * speed * seconds;
+		if (canStand(newX, playerZ)) playerX = newX;
+		float newZ = playerZ + wish.z * speed * seconds;
+		if (canStand(playerX, newZ)) playerZ = newZ;
 
-	// The feet follow the steps, the camera follows the feet a bit later, so the walk on the stairs is smooth
-	float oldFeetY = feetY;
-	feetY = groundHeight(playerX, playerZ, feetY);
-	totalDescent += oldFeetY - feetY;
-	cameraY += (feetY + EYE_HEIGHT - cameraY) * clampValue(12.0f * seconds, 0.0f, 1.0f);
+		// Jump: only from the ground, in the pause it does nothing
+		if (jumpRequested && !airborne && seconds > 0.0f)
+		{
+			airborne = true;
+			verticalVelocity = sqrtf(2.0f * GRAVITY * JUMP_HEIGHT);
+		}
+		jumpRequested = false;
+
+		float oldFeetY = feetY;
+		float ground = groundHeight(playerX, playerZ, feetY);
+		if (airborne)
+		{
+			// In the air the gravity moves the feet down, the ground can change when the player moves (next step),
+			// so we ask for it again
+			verticalVelocity -= GRAVITY * seconds;
+			feetY += verticalVelocity * seconds;
+			ground = groundHeight(playerX, playerZ, feetY);
+			if (feetY <= ground)
+			{
+				feetY = ground;
+				airborne = false;
+				verticalVelocity = 0.0f;
+			}
+		}
+		else
+		{
+			// On the ground the feet follow the steps
+			feetY = ground;
+		}
+		totalDescent += oldFeetY - feetY;
+
+		// The camera follows the feet a bit later, so the walk on the stairs is smooth, in the air it is faster
+		float follow = airborne ? 30.0f : 12.0f;
+		cameraY += (feetY + EYE_HEIGHT - cameraY) * clampValue(follow * seconds, 0.0f, 1.0f);
+	}
 
 	// The loop: the world has the same look every LOOP_FLOORS floors, so the player is moved by exactly
 	// this height and nothing changes on the screen
@@ -1441,15 +1507,199 @@ void updateTitle(float fps)
 	// The window title is the HUD: floor, depth, FPS, the efficiency numbers and the state of the effects
 	int floorNumber = (int)floorf(totalDescent / FLOOR_HEIGHT);
 	int kernel = 2 * lighting.pcfRadius + 1;
-	char title[400];
+	char title[600];
 	snprintf(title, sizeof(title),
-		"SCP-087 | Floor %d | %.1f m | %.0f FPS %.1f ms | %d draws %d tris | Light %s %.0f deg x%.1f | Shadow %s %d px PCF %dx%d | Fog %s %s | Dust %s | MSAA %s | View %s",
+		"Infinite Stairs: SCP-087 (Ismagul, Parunina, Bauyrzhan) | Floor %d | %.1f m | %.0f FPS %.1f ms | %d draws %d tris | Light %s %.0f deg x%.1f | Shadow %s %d px PCF %dx%d | Fog %s %s | Dust %s | MSAA %s | View %s",
 		floorNumber, totalDescent, fps, fps > 0.0f ? 1000.0f / fps : 0.0f, drawCalls, drawnTriangles,
 		lighting.flashlightOn ? "on" : "off", lighting.outerDeg, lighting.intensity,
 		lighting.shadowsOn ? "on" : "off", lighting.shadowSize, kernel, kernel,
 		lighting.fogOn ? "on" : "off", FOG_NAMES[lighting.fogMode], lighting.dustOn ? "on" : "off",
 		lighting.multisample ? "on" : "off", VIEW_NAMES[lighting.debugView]);
 	glfwSetWindowTitle(window, title);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Text on the screen (HUD and help window). The font gives quads, we draw them as triangles
+// ---------------------------------------------------------------------------------------------
+const char* textVertexShaderCode = R"GLSL(
+layout (location = 0) in vec3 vPosition;
+
+uniform vec2 uScreen;   // size of the window in pixels
+uniform float uScale;   // size of one font pixel on the screen
+
+void main()
+{
+	vec2 p = vPosition.xy * uScale;
+	gl_Position = vec4(p.x / uScreen.x * 2.0 - 1.0, 1.0 - p.y / uScreen.y * 2.0, 0.0, 1.0);
+}
+)GLSL";
+
+const char* textFragmentShaderCode = R"GLSL(
+out vec4 FragColor;
+
+uniform vec4 uColor;
+
+void main()
+{
+	FragColor = uColor;
+}
+)GLSL";
+
+GLuint textProgram = 0, textVAO = 0, textVBO = 0, textEBO = 0;
+const int TEXT_MAX_QUADS = 1024;
+float uiScale = 2.0f;
+
+void initText()
+{
+	textProgram = createShaderProgram(textVertexShaderCode, textFragmentShaderCode);
+	glGenVertexArrays(1, &textVAO);
+	glGenBuffers(1, &textVBO);
+	glGenBuffers(1, &textEBO);
+	glBindVertexArray(textVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+	glBufferData(GL_ARRAY_BUFFER, TEXT_MAX_QUADS * 4 * 16, NULL, GL_DYNAMIC_DRAW);
+	// One vertex of the font is 16 bytes: x, y, z and 4 bytes of color (we dont use the color)
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 16, (void*)0);
+	glEnableVertexAttribArray(0);
+
+	// The core profile has no GL_QUADS, so every quad is two triangles
+	std::vector<unsigned int> indices;
+	for (int q = 0; q < TEXT_MAX_QUADS; q++)
+	{
+		unsigned int b = q * 4;
+		unsigned int quad[6] = { b, b + 1, b + 2, b, b + 2, b + 3 };
+		indices.insert(indices.end(), quad, quad + 6);
+	}
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, textEBO);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+	glBindVertexArray(0);
+}
+
+struct TextVertex
+{
+	float x, y, z;
+	unsigned char color[4];
+};
+
+// Draws one line of text, x and y are in font pixels (uiScale makes them bigger on the screen)
+void drawTextLine(float x, float y, const char* text, float r, float g, float b, float a)
+{
+	static char buffer[65536];
+	int quads = stb_easy_font_print(x, y, (char*)text, NULL, buffer, sizeof(buffer));
+	if (quads > TEXT_MAX_QUADS)
+	{
+		quads = TEXT_MAX_QUADS;
+	}
+	glUniform4f(glGetUniformLocation(textProgram, "uColor"), r, g, b, a);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, quads * 4 * 16, buffer);
+	glDrawElements(GL_TRIANGLES, quads * 6, GL_UNSIGNED_INT, 0);
+}
+
+// Text with a dark shadow, so we can read it on any background
+void drawShadowedLine(float x, float y, const char* text, float r, float g, float b)
+{
+	drawTextLine(x + 1.0f, y + 1.0f, text, 0.0f, 0.0f, 0.0f, 1.0f);
+	drawTextLine(x, y, text, r, g, b, 1.0f);
+}
+
+void drawRect(float x, float y, float w, float h, float r, float g, float b, float a)
+{
+	TextVertex v[4];
+	float xs[4] = { x, x + w, x + w, x };
+	float ys[4] = { y, y, y + h, y + h };
+	for (int i = 0; i < 4; i++)
+	{
+		v[i].x = xs[i];
+		v[i].y = ys[i];
+		v[i].z = 0.0f;
+		v[i].color[0] = v[i].color[1] = v[i].color[2] = v[i].color[3] = 255;
+	}
+	glUniform4f(glGetUniformLocation(textProgram, "uColor"), r, g, b, a);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+}
+
+const char* onOff(bool value)
+{
+	return value ? "ON" : "OFF";
+}
+
+void drawHud(float fps)
+{
+	uiScale = fmaxf(1.5f, (float)windowHeight / 360.0f);
+	float screenW = (float)windowWidth / uiScale;
+	float screenH = (float)windowHeight / uiScale;
+
+	// The text is drawn over everything, so no depth test and no culling
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glUseProgram(textProgram);
+	glUniform2f(glGetUniformLocation(textProgram, "uScreen"), (float)windowWidth, (float)windowHeight);
+	glUniform1f(glGetUniformLocation(textProgram, "uScale"), uiScale);
+	glBindVertexArray(textVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+
+	char line[256];
+
+	// Top left: the topic and the team
+	drawShadowedLine(6, 5, "Infinite Stairs: SCP-087  |  Computer Graphics Fundamentals, IT-2505", 0.95f, 0.95f, 0.95f);
+	drawShadowedLine(6, 16, "Team: Nuray Ismagul, Kira Parunina, Dilyara Bauyrzhan", 0.75f, 0.80f, 0.90f);
+
+	// The floor, the depth, the FPS and the state of the shadows (the main technique)
+	int floorNumber = (int)floorf(totalDescent / FLOOR_HEIGHT);
+	snprintf(line, sizeof(line), "Floor %d   Depth %.1f m   %.0f FPS   Camera: %s", floorNumber, totalDescent, fps, freeFly ? "FREE-FLY" : "walk");
+	drawShadowedLine(6, 31, line, 0.85f, 0.85f, 0.60f);
+	snprintf(line, sizeof(line), "Shadows (H): %s   Flashlight (F): %s   Fog (G): %s   Dust (5): %s   PCF %dx%d",
+		onOff(lighting.shadowsOn), onOff(lighting.flashlightOn), onOff(lighting.fogOn), onOff(lighting.dustOn),
+		2 * lighting.pcfRadius + 1, 2 * lighting.pcfRadius + 1);
+	drawShadowedLine(6, 42, line, lighting.shadowsOn ? 0.55f : 1.0f, lighting.shadowsOn ? 1.0f : 0.45f, 0.45f);
+
+	if (paused)
+	{
+		drawShadowedLine(screenW * 0.5f - 24.0f, screenH * 0.5f - 40.0f, "PAUSED (Space)", 1.0f, 0.9f, 0.3f);
+	}
+	drawShadowedLine(6, screenH - 12.0f, "F1: help   Space: pause   C: free-fly   H: shadows on/off", 0.7f, 0.7f, 0.7f);
+
+	// The help window with all the keys
+	if (helpVisible)
+	{
+		const char* lines[] = {
+			"CONTROLS  (F1 closes this window)",
+			"",
+			"Mouse: look around        Wheel: field of view",
+			"W A S D: walk             Shift: run",
+			"J: jump                  Space: PAUSE",
+			"C: free-fly camera (no collisions)",
+			"W A S D move    E up    Q down    Shift faster",
+			"R: back to the start      Esc: exit",
+			"",
+			"H: SHADOW MAPPING on/off",
+			"P: PCF 1 / 3x3 / 5x5      O: shadow map size",
+			", .: shadow bias",
+			"F: flashlight             [ ]: cone angle",
+			"- = : brightness",
+			"G: fog on/off       1 2 3: linear / exp / Gaussian fog",
+			"4: light in the fog       5: dust        B: random flicker",
+			"M: antialiasing           T: textures",
+			"V: debug view (final / shadow / light / fog)",
+			"I: numbers to the console",
+		};
+		int count = (int)(sizeof(lines) / sizeof(lines[0]));
+		float boxW = 330.0f, boxH = 12.0f * count + 14.0f;
+		float boxX = (screenW - boxW) * 0.5f, boxY = (screenH - boxH) * 0.5f;
+		drawRect(boxX, boxY, boxW, boxH, 0.0f, 0.0f, 0.0f, 0.82f);
+		for (int i = 0; i < count; i++)
+		{
+			drawTextLine(boxX + 8.0f, boxY + 8.0f + 12.0f * i, lines[i], i == 0 ? 1.0f : 0.9f, i == 0 ? 0.85f : 0.9f, i == 0 ? 0.3f : 0.9f, 1.0f);
+		}
+	}
+
+	glBindVertexArray(0);
+	glDisable(GL_BLEND);
+	glEnable(GL_CULL_FACE);
+	glEnable(GL_DEPTH_TEST);
 }
 
 void printLighting()
@@ -1481,6 +1731,33 @@ void keyCallback(GLFWwindow* w, int key, int scancode, int action, int mods)
 	// The other keys work once for every press
 	if (action != GLFW_PRESS)
 	{
+		return;
+	}
+
+	// Pause, help, jump and free camera
+	if (key == GLFW_KEY_F1)
+	{
+		helpVisible = !helpVisible;
+		return;
+	}
+	if (key == GLFW_KEY_SPACE)
+	{
+		paused = !paused;
+		return;
+	}
+	if (key == GLFW_KEY_J)
+	{
+		jumpRequested = true;
+		return;
+	}
+	if (key == GLFW_KEY_C)
+	{
+		freeFly = !freeFly;
+		if (!freeFly && !canStand(playerX, playerZ))
+		{
+			// The player cant stand inside a wall or in the well, so he goes back to the start
+			resetPlayer();
+		}
 		return;
 	}
 	if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -1714,7 +1991,7 @@ int main(int argc, char** argv)
 	glfwWindowHint(GLFW_DEPTH_BITS, 24);
 	glfwWindowHint(GLFW_SAMPLES, 4);
 
-	window = glfwCreateWindow(windowWidth, windowHeight, "SCP-087", NULL, NULL);
+	window = glfwCreateWindow(windowWidth, windowHeight, "Infinite Stairs: SCP-087", NULL, NULL);
 	if (window == NULL)
 	{
 		std::cout << "Failed to create GLFW window" << std::endl;
@@ -1754,6 +2031,7 @@ int main(int argc, char** argv)
 	GLuint shadowProgram = createShaderProgram(shadowVertexShaderCode, shadowFragmentShaderCode);
 	GLuint dustProgram = createShaderProgram(dustVertexShaderCode, shared + dustFragmentShaderCode);
 	GLuint faceProgram = createShaderProgram(faceVertexShaderCode, faceFragmentShaderCode);
+	initText();
 
 	// Create the model of one floor, the VAO and the VBO
 	buildFloor();
@@ -1819,6 +2097,7 @@ int main(int argc, char** argv)
 	// Instructions for the user
 	std::cout << "Mouse: look around, mouse wheel: field of view" << std::endl;
 	std::cout << "W A S D: walk, Shift: run, R: back to the start, Esc: exit" << std::endl;
+	std::cout << "F1: help on the screen, Space: pause, C: free-fly camera (E up, Q down)" << std::endl;
 	std::cout << "F: flashlight, [ ]: cone angle, - =: flashlight brightness" << std::endl;
 	std::cout << "H: shadows, P: PCF (hard / 3x3 / 5x5), O: shadow map size, , .: shadow bias" << std::endl;
 	std::cout << "G: fog, 1 2 3: linear / exponential / Gaussian fog, 4: light in the fog" << std::endl;
@@ -1831,6 +2110,7 @@ int main(int argc, char** argv)
 	int frames = 0;
 	long totalFrames = 0;
 	float fps = 0.0f;
+	float simClock = 0.0f;   // the time without the pauses
 
 	// Main while loop
 	while (!glfwWindowShouldClose(window))
@@ -1839,6 +2119,14 @@ int main(int argc, char** argv)
 		double currentTime = glfwGetTime();
 		float seconds = clampValue((float)(currentTime - lastTime), 0.0f, 0.1f);
 		lastTime = currentTime;
+
+		// In the pause simSeconds is 0, so the player, lamps, dust and events stop
+		// The mouse and the flashlight sway use the real time, so the head still turns
+		float simSeconds = paused ? 0.0f : seconds;
+		if (!paused)
+		{
+			simClock += seconds;
+		}
 
 		// FPS is counted for half a second and is shown in the title
 		frames++;
@@ -1854,12 +2142,12 @@ int main(int argc, char** argv)
 		drawnTriangles = 0;
 
 		// Update the player and the lights
-		updatePlayer(seconds);
+		updatePlayer(simSeconds);
 		for (int i = 0; i < LOOP_FLOORS; i++)
 		{
-			updateLamp(lamps[i], seconds);
+			updateLamp(lamps[i], simSeconds);
 		}
-		updateLamp(flashlight, seconds);
+		updateLamp(flashlight, simSeconds);
 
 		// Depth-based lighting event
 		if (!depthEventTriggered && totalDescent >= 15.0f)
@@ -1885,7 +2173,7 @@ int main(int argc, char** argv)
 
 		if (redLightEventTimer > 0.0f)
 		{
-			redLightEventTimer -= seconds;
+			redLightEventTimer -= simSeconds;
 
 			if (redLightEventTimer < 0.0f)
 			{
@@ -1895,7 +2183,7 @@ int main(int argc, char** argv)
 
 		if (depthEventTimer > 0.0f)
 		{
-			depthEventTimer -= seconds;
+			depthEventTimer -= simSeconds;
 			if (depthEventTimer < 0.0f)
 			{
 				depthEventTimer = 0.0f;
@@ -1904,7 +2192,7 @@ int main(int argc, char** argv)
 
 		if (faceEventTimer > 0.0f)
 		{
-			faceEventTimer -= seconds;
+			faceEventTimer -= simSeconds;
 
 			if (faceEventTimer <= 0.0f)
 			{
@@ -1956,7 +2244,7 @@ int main(int argc, char** argv)
 		float redLightFactor = 0.0f;
 		if (redLightEventTimer > 0.0f)
 		{
-			redLightFactor = 0.65f + 0.20f * sinf((float)currentTime * 10.0f);
+			redLightFactor = 0.65f + 0.20f * sinf(simClock * 10.0f);
 		}
 
 		// The camera: yaw and pitch give the direction of the view, the position is the eye of the player
@@ -2008,7 +2296,7 @@ int main(int argc, char** argv)
 		}
 		if (lighting.dustOn)
 		{
-			updateDust(seconds, cameraY);
+			updateDust(simSeconds, cameraY);
 		}
 
 		// The floor of the player and the floors around him
@@ -2150,7 +2438,7 @@ int main(int argc, char** argv)
 
 		if (faceJumpScareActive)
 		{
-			faceJumpScareTimer -= seconds;
+			faceJumpScareTimer -= simSeconds;
 
 			faceAttackProgress = 1.0f - faceJumpScareTimer / FACE_ATTACK_DURATION;
 
@@ -2174,6 +2462,9 @@ int main(int argc, char** argv)
 			glEnable(GL_CULL_FACE);
 			glEnable(GL_DEPTH_TEST);
 		}
+
+		// The text is drawn last, over everything
+		drawHud(fps);
 
 		// Swap the back buffer with the front buffer
 		glfwSwapBuffers(window);
@@ -2203,6 +2494,10 @@ int main(int argc, char** argv)
 	glDeleteProgram(shadowProgram);
 	glDeleteProgram(dustProgram);
 	glDeleteProgram(faceProgram);
+	glDeleteProgram(textProgram);
+	glDeleteVertexArrays(1, &textVAO);
+	glDeleteBuffers(1, &textVBO);
+	glDeleteBuffers(1, &textEBO);
 	glfwDestroyWindow(window);
 	glfwTerminate();
 	return 0;
