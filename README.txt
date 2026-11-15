@@ -45,7 +45,7 @@ KEYS (F1 shows the same list on the screen)
   F       | flashlight on / off                                                          ||[ ]         | cone angle 12-45 deg      
   G       | fog on / off                                                                 ||1 2 3       |linear / exponential / Gaussian fog
   4       | light in the fog                                                             ||5           |dust
-  M       | antialiasing (MSAA)                                                          ||            |
+  M       | antialiasing (MSAA)                                                          ||J           | Jump
   V       | debug view: final / shadow / light / fog                                     ||F1          | help window on the screen     
   I       | print the numbers of the lighting part to the console                        ||Esc         | exit
 
