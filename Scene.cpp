@@ -6,6 +6,8 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -587,392 +589,43 @@ struct FrameLight
 
 // This code is used by the fragment shader of the scene and by the fragment shader of the dust:
 // the spotlight, the shadow test and the fog are written only once
-const char* lightingSharedCode = R"GLSL(
-// Shadow map: a depth texture with the hardware depth compare
-uniform sampler2DShadow uShadowMap;
-uniform bool uUseShadow;
-uniform int uPcfRadius;
-uniform float uShadowBias;
-
-// The flashlight is a spotlight, its position and direction are in the eye coordinates
-uniform bool uFlashlightOn;
-uniform vec3 uFlashPosition;
-uniform vec3 uFlashDirection;
-uniform float uFlashInner;
-uniform float uFlashOuter;
-uniform float uFlashIntensity;
-uniform float uSpotExponent;
-uniform vec3 uFlashAttenuation;
-uniform vec3 uFlashColor;
-
-// Fog
-uniform bool uUseFog;
-uniform int uFogMode;
-uniform float uFogDensity;
-uniform vec3 uFogColor;
-
-// Spotlight: 0 outside the outer cone, 1 inside the inner cone, between them a ramp that is made sharper by the exponent
-// L is the direction from the fragment to the light
-float spotFactor(vec3 L)
-{
-	float theta = dot(-L, uFlashDirection);
-	float ramp = clamp((theta - uFlashOuter) / (uFlashInner - uFlashOuter), 0.0, 1.0);
-	return pow(ramp, uSpotExponent);
-}
-
-// Distance term 1 / (a + b * d + c * d * d)
-float flashAttenuation(float d)
-{
-	return 1.0 / (uFlashAttenuation.x + uFlashAttenuation.y * d + uFlashAttenuation.z * d * d);
-}
-
-// Shadow mapping: compares the depth of the fragment with the depth that the flashlight has seen
-// With PCF the neighbour texels are also used, every lookup is already filtered by the hardware
-// The result is 1 in the light and 0 in the shadow
-float shadowFactor(vec4 shadowCoord, float cosTheta)
-{
-	if (!uUseShadow || shadowCoord.w <= 0.0)
-	{
-		return 1.0;
-	}
-	vec3 p = shadowCoord.xyz / shadowCoord.w;
-	p = p * 0.5 + 0.5;
-	if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0)
-	{
-		return 1.0;
-	}
-	// The bias is bigger on the surfaces that are almost parallel to the light rays
-	float bias = uShadowBias * (1.0 + 2.0 * (1.0 - cosTheta));
-	vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
-	float lit = 0.0;
-	for (int x = -uPcfRadius; x <= uPcfRadius; x++)
-	{
-		for (int y = -uPcfRadius; y <= uPcfRadius; y++)
-		{
-			lit += textureLod(uShadowMap, vec3(p.xy + vec2(x, y) * texel, p.z - bias), 0.0);
-		}
-	}
-	float taps = float((2 * uPcfRadius + 1) * (2 * uPcfRadius + 1));
-	return lit / taps;
-}
-
-// Fog: the visibility is 1 near the camera and goes to 0 far away. The color of the pixel is
-// visibility * color + (1 - visibility) * fog color
-float fogVisibility(float d)
-{
-	if (uFogMode == 0)
-	{
-		// Linear (depth cueing)
-		float fogEnd = 2.5 / uFogDensity;
-		float fogStart = 0.15 / uFogDensity;
-		return clamp((fogEnd - d) / (fogEnd - fogStart), 0.0, 1.0);
-	}
-	if (uFogMode == 1)
-	{
-		// Exponential
-		return exp(-d * uFogDensity);
-	}
-	// Gaussian
-	float x = d * uFogDensity;
-	return exp(-x * x);
-}
-)GLSL";
+// GLSL code of this shader: shaders/lighting_shared.glsl
 
 // Vertex Shader of the scene: model -> view -> projection, and the position in the light space for the shadow
-const char* sceneVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 vPosition;
-layout (location = 1) in vec3 vNormal;
-layout (location = 2) in vec2 vUV;
-layout (location = 3) in float vMaterial;
-uniform mat4 uModel;
-uniform mat4 uView;
-uniform mat4 uProjection;
-uniform mat4 uLightVP;
-uniform vec3 uLightWorldPosition;
-uniform float uNormalOffset;
-uniform float uShadowTexelScale;
-out vec3 fPositionEye;
-out vec3 fNormalEye;
-out vec2 fUV;
-flat out float fMaterial;
-out vec4 fShadowCoord;
-void main()
-{
-	// The model matrix only moves the floor to its place, so the normal needs only the rotation of the view matrix
-	vec4 worldPosition = uModel * vec4(vPosition, 1.0);
-	vec4 eyePosition = uView * worldPosition;
-	fPositionEye = eyePosition.xyz;
-	fNormalEye = mat3(uView) * vNormal;
-	fUV = vUV;
-	fMaterial = vMaterial;
-
-	// Normal offset: the point is moved a little along its normal before the shadow test, so the surface does not
-	// shadow itself. The shadow texels get bigger with the distance, so the offset also gets bigger
-	float lightDistance = length(worldPosition.xyz - uLightWorldPosition);
-	vec3 shadowPoint = worldPosition.xyz + vNormal * (uNormalOffset * uShadowTexelScale * lightDistance);
-	fShadowCoord = uLightVP * vec4(shadowPoint, 1.0);
-	gl_Position = uProjection * eyePosition;
-}
-)GLSL";
+// GLSL code of this shader: shaders/scene.vert
 
 // Fragment Shader of the scene
-const char* sceneFragmentShaderCode = R"GLSL(
-in vec3 fPositionEye;
-in vec3 fNormalEye;
-in vec2 fUV;
-flat in float fMaterial;
-in vec4 fShadowCoord;
-out vec4 FragColor;
-
-uniform sampler2D uTexConcrete;
-uniform sampler2D uTexMetal;
-uniform bool uUseTexture;
-uniform bool uFogScatter;
-uniform int uDebugView;
-
-// The lamps are point lights without shadows
-uniform int uLampCount;
-uniform vec3 uLampPosition[4];
-uniform vec3 uLampColor[4];
-uniform float uLampLevel[4];
-
-// The glow of the body of the lamp of the floor that is drawn now
-uniform float uGlowLevel;
-uniform vec3 uGlowColor;
-
-uniform float uSceneBrightness;
-
-// Blinn-Phong: diffuse + specular with the halfway vector
-vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 specularColor, float shininess)
-{
-	float diffuse = max(dot(N, L), 0.0);
-	float specular = 0.0;
-	if (diffuse > 0.0)
-	{
-		vec3 H = normalize(L + V);
-		specular = pow(max(dot(N, H), 0.0), shininess);
-	}
-	return diffuse * albedo + specular * specularColor;
-}
-
-void main()
-{
-	// Both textures are always read (it is safe for the mipmap levels), the material chooses one of them
-	vec3 texConcrete = texture(uTexConcrete, fUV).rgb;
-	vec3 texMetal = texture(uTexMetal, fUV).rgb;
-	vec3 N = normalize(fNormalEye);
-	vec3 V = normalize(-fPositionEye);
-	vec3 color;
-
-	// Numbers for the debug views
-	float debugShadow = 1.0;
-	float debugLight = 0.0;
-	float flashAmount = 0.0;
-
-	if (fMaterial > 1.5)
-	{
-		// The body of the lamp: it shines by itself
-		color = uGlowColor * uGlowLevel;
-	}
-	else
-	{
-		vec3 albedo = texConcrete;
-		vec3 specularColor = vec3(0.08);
-		float shininess = 10.0;
-		if (fMaterial > 0.5)
-		{
-			albedo = texMetal;
-			specularColor = vec3(0.6);
-			shininess = 48.0;
-		}
-		if (!uUseTexture)
-		{
-			albedo = vec3(0.5);
-		}
-		// The textures are in the sRGB space, the lighting is calculated in the linear space
-		albedo = pow(albedo, vec3(2.2));
-
-		// Very weak ambient light, only to see that the world is not completely black
-		color = vec3(0.012, 0.014, 0.020) * albedo;
-
-		if (uFlashlightOn)
-		{
-			vec3 toLight = uFlashPosition - fPositionEye;
-			float d = length(toLight);
-			vec3 L = toLight / d;
-			float spot = spotFactor(L);
-			float attenuation = flashAttenuation(d);
-			float shadow = shadowFactor(fShadowCoord, max(dot(N, L), 0.0));
-			flashAmount = uFlashIntensity * attenuation * spot;
-			debugShadow = shadow;
-			debugLight = flashAmount * max(dot(N, L), 0.0) * shadow;
-			color += blinnPhong(N, V, L, albedo, specularColor, shininess) * uFlashColor * (flashAmount * shadow);
-		}
-
-		for (int i = 0; i < uLampCount; i++)
-		{
-			vec3 toLamp = uLampPosition[i] - fPositionEye;
-			float d = length(toLamp);
-			vec3 L = toLamp / d;
-			float attenuation = 1.0 / (1.0 + 0.30 * d + 0.10 * d * d);
-			color += blinnPhong(N, V, L, albedo, specularColor, shininess) * uLampColor[i] * (uLampLevel[i] * attenuation);
-		}
-	}
-
-	// Fog: the farther the fragment, the more it gets the color of the fog
-	float visibility = 1.0;
-	if (uUseFog)
-	{
-		visibility = fogVisibility(length(fPositionEye));
-		vec3 fogColor = uFogColor;
-		// Light scattering: the fog shines a little where the cone of the flashlight goes through it
-		if (uFogScatter && uFlashlightOn)
-		{
-			fogColor += uFlashColor * (0.12 * flashAmount);
-		}
-		color = mix(fogColor, color, visibility);
-	}
-
-	// Debug views: only one number is shown as gray
-	if (uDebugView == 1)
-	{
-		float inCone = (flashAmount > 0.0) ? 1.0 : 0.15;
-		FragColor = vec4(vec3(debugShadow * inCone), 1.0);
-		return;
-	}
-	if (uDebugView == 2)
-	{
-		FragColor = vec4(vec3(clamp(debugLight, 0.0, 1.0)), 1.0);
-		return;
-	}
-	if (uDebugView == 3)
-	{
-		FragColor = vec4(vec3(visibility), 1.0);
-		return;
-	}
-
-	// Global brightness (it is used by the events), a too bright pixel is cut to 1
-	color *= uSceneBrightness;
-	color = min(color, vec3(1.0));
-
-	// Back to the sRGB space
-	color = pow(color, vec3(1.0 / 2.2));
-	FragColor = vec4(color, 1.0);
-}
-)GLSL";
+// GLSL code of this shader: shaders/scene.frag
 
 // The shadow pass only needs the depth, so its shaders are very small
-const char* shadowVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 vPosition;
-uniform mat4 uModel;
-uniform mat4 uLightVP;
-void main()
-{
-	gl_Position = uLightVP * uModel * vec4(vPosition, 1.0);
-}
-)GLSL";
+// GLSL code of this shader: shaders/shadow.vert
 
-const char* shadowFragmentShaderCode = R"GLSL(
-void main()
-{
-}
-)GLSL";
+// GLSL code of this shader: shaders/shadow.frag
 
 // Dust: every particle is a point. It is visible only where the flashlight lights it (and the shadows are used too)
-const char* dustVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 pWorld;
-layout (location = 1) in vec2 pData;
-uniform mat4 uView;
-uniform mat4 uProjection;
-uniform mat4 uLightVP;
-uniform float uPointScale;
-out vec3 fPositionEye;
-out float fAlpha;
-out vec4 fShadowCoord;
-void main()
-{
-	vec4 eyePosition = uView * vec4(pWorld, 1.0);
-	fPositionEye = eyePosition.xyz;
-	fAlpha = pData.y;
-	fShadowCoord = uLightVP * vec4(pWorld, 1.0);
-	gl_Position = uProjection * eyePosition;
-	// The size in pixels is the size in meters divided by the distance
-	float dist = max(-eyePosition.z, 0.1);
-	gl_PointSize = clamp(pData.x * uPointScale / dist, 1.0, 14.0);
-}
-)GLSL";
+// GLSL code of this shader: shaders/dust.vert
 
-const char* dustFragmentShaderCode = R"GLSL(
-in vec3 fPositionEye;
-in float fAlpha;
-in vec4 fShadowCoord;
-out vec4 FragColor;
-uniform float uSceneBrightness;
-void main()
-{
-	// A soft round point
-	vec2 c = gl_PointCoord * 2.0 - 1.0;
-	float r2 = dot(c, c);
-	if (r2 > 1.0)
-	{
-		discard;
-	}
-	float brightness = 0.0;
-	if (uFlashlightOn)
-	{
-		vec3 toLight = uFlashPosition - fPositionEye;
-		float d = length(toLight);
-		brightness = spotFactor(toLight / d) * flashAttenuation(d) * uFlashIntensity * shadowFactor(fShadowCoord, 1.0);
-	}
-	float distanceToEye = length(fPositionEye);
-	float visibility = 1.0;
-	if (uUseFog)
-	{
-		visibility = fogVisibility(distanceToEye);
-	}
-	// The dust very close to the eye fades out, otherwise it would be a big spot
-	float nearFade = smoothstep(0.3, 1.0, distanceToEye);
-	float alpha = (1.0 - r2) * fAlpha * nearFade * visibility * clamp(brightness, 0.0, 1.0);
-	vec3 color = pow(uFlashColor * uSceneBrightness, vec3(1.0 / 2.2));
-	FragColor = vec4(color, alpha);
-}
-)GLSL";
+// GLSL code of this shader: shaders/dust.frag
 
 // The billboard of the face (it is drawn without the lighting)
-const char* faceVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 vPosition;
-layout (location = 1) in vec2 vUV;
+// GLSL code of this shader: shaders/face.vert
 
-uniform mat4 uView;
-uniform mat4 uProjection;
+// GLSL code of this shader: shaders/face.frag
 
-out vec2 fUV;
-
-void main()
+// Reads a whole text file (a shader) into a string. The path is relative to the working directory.
+// If the file cannot be opened, the error is printed to the console and the string is empty
+std::string readTextFile(const std::string& path)
 {
-	fUV = vUV;
-	gl_Position = uProjection * uView * vec4(vPosition, 1.0);
+	std::ifstream file(path);
+	if (!file.is_open())
+	{
+		std::cout << "Failed to open shader file: " << path << std::endl;
+		return "";
+	}
+	std::stringstream buffer;
+	buffer << file.rdbuf();
+	return buffer.str();
 }
-)GLSL";
-
-const char* faceFragmentShaderCode = R"GLSL(
-in vec2 fUV;
-out vec4 FragColor;
-
-uniform sampler2D uFaceTexture;
-uniform float uFaceAlpha;
-
-void main()
-{
-	vec4 face = texture(uFaceTexture, fUV);
-
-	if (face.a < 0.05)
-		discard;
-
-	face.a *= uFaceAlpha;
-	FragColor = face;
-}
-)GLSL";
 
 GLuint compileShader(GLenum type, const std::string& code)
 {
@@ -1521,29 +1174,9 @@ void updateTitle(float fps)
 // ---------------------------------------------------------------------------------------------
 // Text on the screen (HUD and help window). The font gives quads, we draw them as triangles
 // ---------------------------------------------------------------------------------------------
-const char* textVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 vPosition;
+// GLSL code of this shader: shaders/text.vert
 
-uniform vec2 uScreen;   // size of the window in pixels
-uniform float uScale;   // size of one font pixel on the screen
-
-void main()
-{
-	vec2 p = vPosition.xy * uScale;
-	gl_Position = vec4(p.x / uScreen.x * 2.0 - 1.0, 1.0 - p.y / uScreen.y * 2.0, 0.0, 1.0);
-}
-)GLSL";
-
-const char* textFragmentShaderCode = R"GLSL(
-out vec4 FragColor;
-
-uniform vec4 uColor;
-
-void main()
-{
-	FragColor = uColor;
-}
-)GLSL";
+// GLSL code of this shader: shaders/text.frag
 
 GLuint textProgram = 0, textVAO = 0, textVBO = 0, textEBO = 0;
 const int TEXT_MAX_QUADS = 1024;
@@ -1551,7 +1184,7 @@ float uiScale = 2.0f;
 
 void initText()
 {
-	textProgram = createShaderProgram(textVertexShaderCode, textFragmentShaderCode);
+	textProgram = createShaderProgram(readTextFile("shaders/text.vert"), readTextFile("shaders/text.frag"));
 	glGenVertexArrays(1, &textVAO);
 	glGenBuffers(1, &textVBO);
 	glGenBuffers(1, &textEBO);
@@ -2026,11 +1659,11 @@ int main(int argc, char** argv)
 	resetLighting();
 
 	// The fragment shaders of the scene and of the dust use the same code of the light, the shadow and the fog
-	std::string shared = lightingSharedCode;
-	GLuint sceneProgram = createShaderProgram(sceneVertexShaderCode, shared + sceneFragmentShaderCode);
-	GLuint shadowProgram = createShaderProgram(shadowVertexShaderCode, shadowFragmentShaderCode);
-	GLuint dustProgram = createShaderProgram(dustVertexShaderCode, shared + dustFragmentShaderCode);
-	GLuint faceProgram = createShaderProgram(faceVertexShaderCode, faceFragmentShaderCode);
+	std::string shared = readTextFile("shaders/lighting_shared.glsl");
+	GLuint sceneProgram = createShaderProgram(readTextFile("shaders/scene.vert"), shared + readTextFile("shaders/scene.frag"));
+	GLuint shadowProgram = createShaderProgram(readTextFile("shaders/shadow.vert"), readTextFile("shaders/shadow.frag"));
+	GLuint dustProgram = createShaderProgram(readTextFile("shaders/dust.vert"), shared + readTextFile("shaders/dust.frag"));
+	GLuint faceProgram = createShaderProgram(readTextFile("shaders/face.vert"), readTextFile("shaders/face.frag"));
 	initText();
 
 	// Create the model of one floor, the VAO and the VBO

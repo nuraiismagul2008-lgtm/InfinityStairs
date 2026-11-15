@@ -9,15 +9,25 @@ LIBRARIES (all are in the archive, folder Libraries\)
   stb_image.h (loads the PNG), stb_easy_font.h (on-screen text).
        - No GLM, no engine.
 
+SHADERS
+  All GLSL code is in the folder shaders\ (loaded at start-up from files, relative to the working directory):
+    lighting_shared.glsl  spotlight + shadow mapping (PCF, normal offset, bias) + fog; added in front of scene.frag and dust.frag
+    scene.vert / scene.frag    main pass (Phong / Blinn-Phong, flashlight, lamps, shadow test, fog)
+    shadow.vert / shadow.frag  depth-only pass into the shadow map (FBO)
+    dust.vert / dust.frag      dust particles lit by the flashlight
+    face.vert / face.frag      billboard of the SCP face
+    text.vert / text.frag      on-screen text
+  A shader compile or link error is printed to the console. A missing shader file is printed too.
+
 HOW TO BUILD AND RUN
   1. Unzip the whole archive.
   2. Open SCP-087_FinalProject.slnx, choose Debug | x64.
   3. Press Ctrl+F5 (Start Without Debugging).
 
-  The program loads assets\textures\scp_face.png and assets\audio\gloomy_demonic_drone.wav relative to the
-  working directory. From Visual Studio this is the project folder.
+  The program loads shaders\*.glsl, assets\textures\scp_face.png and assets\audio\gloomy_demonic_drone.wav
+  relative to the working directory. From Visual Studio this is the project folder.
    *If you start the .exe by hand,
-   start it from the folder that contains assets\, otherwise the face and the sound are missing (a message is
+   start it from the folder that contains assets\, otherwise the shaders, the face and the sound are missing (a message is
    printed to the console).
 
 HEADLINE TECHNIQUE
@@ -48,3 +58,17 @@ EVENTS (walk down the stairs)
   48 m   red emergency light and a sound
   51 m   the scene gets dark, the SCP face appears; at distance < 4 m the face attacks (jump scare)
   The world is a loop of 6 floors, so the stairs never end
+
+
+ASSETS, SOURCES AND LICENSES
+  Written by the team:
+    - all shader code (folder shaders\), the geometry of the stairwell, the lamps and the dust
+    - the textures of the walls, the metal and the steps: generated in the code (procedural)
+  External files:
+    assets\textures\scp_face.png
+        Source URL:
+    assets\audio\gloomy_demonic_drone.wav
+        Source URL:
+  Idea and setting: SCP-087 from the SCP Foundation wiki
+  Libraries: GLFW 3.4 (zlib license), glad (public domain / MIT), stb_image.h and stb_easy_font.h (public domain / MIT).
+  No other libraries are used (no GLM, no engine).
