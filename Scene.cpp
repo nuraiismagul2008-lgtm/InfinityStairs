@@ -585,35 +585,6 @@ struct FrameLight
 
 // ---------------------------------------------------------------------------------------------
 // Shaders. All the lighting is calculated per fragment (Phong shading) in the camera (eye) coordinates
-// ---------------------------------------------------------------------------------------------
-
-// This code is used by the fragment shader of the scene and by the fragment shader of the dust:
-// the spotlight, the shadow test and the fog are written only once
-// GLSL code of this shader: shaders/lighting_shared.glsl
-
-// Vertex Shader of the scene: model -> view -> projection, and the position in the light space for the shadow
-// GLSL code of this shader: shaders/scene.vert
-
-// Fragment Shader of the scene
-// GLSL code of this shader: shaders/scene.frag
-
-// The shadow pass only needs the depth, so its shaders are very small
-// GLSL code of this shader: shaders/shadow.vert
-
-// GLSL code of this shader: shaders/shadow.frag
-
-// Dust: every particle is a point. It is visible only where the flashlight lights it (and the shadows are used too)
-// GLSL code of this shader: shaders/dust.vert
-
-// GLSL code of this shader: shaders/dust.frag
-
-// The billboard of the face (it is drawn without the lighting)
-// GLSL code of this shader: shaders/face.vert
-
-// GLSL code of this shader: shaders/face.frag
-
-// Reads a whole text file (a shader) into a string. The path is relative to the working directory.
-// If the file cannot be opened, the error is printed to the console and the string is empty
 std::string readTextFile(const std::string& path)
 {
 	std::ifstream file(path);
@@ -964,9 +935,9 @@ bool paused = false;         // Space: stops the animation, the mouse still turn
 bool helpVisible = false;    // F1: the keys on the screen
 bool freeFly = false;        // C: free camera, no collisions
 const float FLY_SPEED = 4.0f;
-const float GRAVITY = 14.0f;       // stronger than in real life, so the jump looks better
-const float JUMP_HEIGHT = 0.55f;   // in meters, small, so the head does not hit the stairs above
-bool jumpRequested = false;        // J: the key callback sets it, updatePlayer uses it once
+const float GRAVITY = 14.0f;      
+const float JUMP_HEIGHT = 0.55f;
+bool jumpRequested = false;       
 bool airborne = false;
 float verticalVelocity = 0.0f;
 bool firstMouse = true;
