@@ -61,14 +61,21 @@ EVENTS (walk down the stairs)
 
 
 ASSETS, SOURCES AND LICENSES
-  Written by the team:
-    - all shader code (folder shaders\), the geometry of the stairwell, the lamps and the dust
-    - the textures of the walls, the metal and the steps: generated in the code (procedural)
-  External files:
-    assets\textures\scp_face.png
-        Source URL:
-    assets\audio\gloomy_demonic_drone.wav
-        Source URL:
-  Idea and setting: SCP-087 from the SCP Foundation wiki
-  Libraries: GLFW 3.4 (zlib license), glad (public domain / MIT), stb_image.h and stb_easy_font.h (public domain / MIT).
-  No other libraries are used (no GLM, no engine).
+
+Written by the team:
+  - All shader code (folder shaders\), the geometry of the stairwell, the lamps and the dust.
+  - Wall, metal and stair textures generated procedurally in the code.
+
+External files:
+  assets\textures\scp_face.png
+    Source: Original visual design generated using OpenAI image generation specifically for this project.
+    Description: Custom SCP-inspired face texture created for the game's jump-scare event.
+
+  assets\audio\gloomy_demonic_drone.wav
+    Source: Pixabay — Gloomy Demonic Drone.
+    URL: https://pixabay.com/sound-effects/film-special-effects-gloomy-demonic-drone-dark-ambient-horror-atmosphere-543162/
+    License: Pixabay Content License.
+
+Idea and setting: SCP-087 from the SCP Foundation wiki.
+Libraries: GLFW 3.4 (zlib license), glad (public domain / MIT), stb_image.h and stb_easy_font.h (public domain / MIT).
+No other libraries are used (no GLM, no engine).
