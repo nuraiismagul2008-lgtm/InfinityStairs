@@ -1,6 +1,13 @@
-// SCP-087 "Infinite Stairs" - Final Project (beta)
+// SCP-087 "Infinite Stairs" - Final Project
 // A real-time first-person demo of an endless dark stairwell. The player has only a flashlight.
 // Modern OpenGL 3.3 Core, GLFW + glad.
+//
+// Lighting, shadows and visibility part:
+//   - spotlight flashlight (cone, soft edge, cos^e shape, 1 / (a + b d + c d^2) attenuation, hand sway)
+//   - shadow mapping (depth texture in a frame buffer object, normal offset + bias, PCF 1x1 / 3x3 / 5x5)
+//   - fog: linear, exponential and Gaussian, thicker with the depth, light scattering in the fog
+//   - dust particles that are lit by the flashlight (particle system) and cast no light themselves
+//   - debug views of the shadows, the light and the fog, and the numbers about the performance
 
 #include <iostream>
 #include <vector>
@@ -13,17 +20,23 @@
 #include <GLFW/glfw3.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <mmsystem.h>
-
+#ifdef _MSC_VER
 #pragma comment(lib, "Winmm.lib")
+#endif
+#endif
 
 const float PI = 3.14159265f;
 
+// ---------------------------------------------------------------------------------------------
 // Building constants. One "floor" is the module that is repeated again and again:
 // north landing -> flight 1 (west side, goes south) -> south landing -> flight 2 (east side, goes north)
 // The top of the north landing is y = 0, every next floor is FLOOR_HEIGHT lower
-
+// ---------------------------------------------------------------------------------------------
 const int LOOP_FLOORS = 6;               // after this many floors the world repeats and the player is moved back
 const int STEPS_PER_FLIGHT = 12;         // 12 treads + the edge of the landing = 13 steps in every flight
 const float STEP_DEPTH = 0.28f;
@@ -46,7 +59,7 @@ const int FLOORS_ABOVE = 2;
 const int FLOORS_BELOW = 3;
 const int MAX_LAMPS = 4;
 
-// player
+// Player
 const float EYE_HEIGHT = 1.65f;
 const float PLAYER_RADIUS = 0.25f;
 const float STEP_UP = 0.55f;
@@ -57,14 +70,20 @@ const float MOUSE_SENSITIVITY = 0.1f;
 // Flashlight: it is held in the right hand, a bit lower than the eyes, so the shadows can be seen
 const float FLASH_OFFSET_X = 0.22f;
 const float FLASH_OFFSET_Y = -0.20f;
-const float FLASH_INNER_DEG = 14.0f;
 const float FLASH_OUTER_DEG = 26.0f;
+const float FLASH_INNER_RATIO = 0.54f;   // the inner cone is this part of the outer cone
+const float FLASH_FOLLOW_SPEED = 14.0f;  // how fast the hand follows the head (bigger = faster)
+const float FLASH_COLOR[3] = { 1.0f, 0.94f, 0.80f };
 
-const int SHADOW_SIZE = 2048;
 const int TEXTURE_SIZE = 256;
 
-// vector + matrix math - 3d vector
+// Dust in the air (particle system)
+const int DUST_COUNT = 900;
+const float DUST_RANGE_Y = 3.5f;         // the dust lives this far above and below the player
 
+// ---------------------------------------------------------------------------------------------
+// A simple 3D vector and the small functions that we need for it
+// ---------------------------------------------------------------------------------------------
 struct Vec3 { float x, y, z; };
 
 Vec3 makeVec(float x, float y, float z)
@@ -105,7 +124,7 @@ float length(Vec3 a)
 
 Vec3 normalize(Vec3 a)
 {
-	// vector with no l = 0,0,0 - not divisible by zero
+	// A vector without length stays (0, 0, 0), so we never divide by zero
 	float l = length(a);
 	if (l < 0.000001f)
 	{
@@ -123,7 +142,7 @@ float clampValue(float value, float minValue, float maxValue)
 
 float randomFloat()
 {
-	// random num 0-1
+	// A random number from 0 to 1
 	return (float)rand() / (float)RAND_MAX;
 }
 
@@ -132,8 +151,9 @@ float randomRange(float minValue, float maxValue)
 	return minValue + (maxValue - minValue) * randomFloat();
 }
 
-// Matrices = arrays of 16 floats
-
+// ---------------------------------------------------------------------------------------------
+// Matrices are arrays of 16 floats, column by column, so OpenGL can use them directly
+// ---------------------------------------------------------------------------------------------
 void identityMatrix(float* m)
 {
 	for (int i = 0; i < 16; i++)
@@ -148,7 +168,7 @@ void identityMatrix(float* m)
 
 void multiplyMatrices(const float* a, const float* b, float* result)
 {
-	// result = a * b - temporary array
+	// result = a * b. A temporary array is used, so the result can be the same array as a or b
 	float temp[16];
 	for (int column = 0; column < 4; column++)
 	{
@@ -178,7 +198,7 @@ void translationMatrix(Vec3 t, float* m)
 
 void lookAt(Vec3 eye, Vec3 target, Vec3 up, float* m)
 {
-	// camera looks from eye to target - f = forward, s = right, u = up
+	// The camera looks from eye to target. f is forward, s is right, u is up
 	Vec3 f = normalize(subtract(target, eye));
 	Vec3 s = normalize(cross(f, up));
 	Vec3 u = cross(s, f);
@@ -211,16 +231,24 @@ void perspectiveMatrix(float fovDegrees, float aspect, float nearPlane, float fa
 
 Vec3 transformPoint(const float* m, Vec3 p)
 {
-	// Multiply the points by matrix
+	// Multiply the point (x, y, z, 1) by the matrix
 	return makeVec(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
 		m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
 		m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
 }
 
+Vec3 transformDirection(const float* m, Vec3 d)
+{
+	// A direction is the vector (x, y, z, 0), so the translation of the matrix is not used
+	return makeVec(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+		m[1] * d.x + m[5] * d.y + m[9] * d.z,
+		m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
 
+// ---------------------------------------------------------------------------------------------
 // The model of one floor. Every vertex has position (3), normal (3), texture coordinates (2) and material (1)
 // Materials: 0 = concrete, 1 = metal, 2 = lamp (it shines by itself)
-
+// ---------------------------------------------------------------------------------------------
 std::vector<float> meshData;
 int vertexCount = 0;
 
@@ -319,8 +347,9 @@ void buildFloor()
 	addBox(-0.2f, lamp.y - 0.08f, HALF_Z - 0.12f, 0.2f, lamp.y + 0.08f, HALF_Z, 2.0f);
 }
 
+// ---------------------------------------------------------------------------------------------
 // Procedural textures. A value noise with a period is used, so the textures can be repeated without seams
-
+// ---------------------------------------------------------------------------------------------
 float hashLattice(int x, int y, int seed)
 {
 	// The same input always gives the same number from 0 to 1
@@ -447,36 +476,19 @@ GLuint loadPNGTexture(const std::string& path)
 
 	stbi_set_flip_vertically_on_load(true);
 
-	unsigned char* image = stbi_load(
-		path.c_str(),
-		&width,
-		&height,
-		&channels,
-		STBI_rgb_alpha
-	);
+	unsigned char* image = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
 
 	if (!image)
 	{
-		std::cout << "Failed to load texture: "
-			<< path << std::endl;
+		std::cout << "Failed to load texture: " << path << std::endl;
 		return 0;
 	}
 
 	GLuint texture;
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
-
-	glTexImage2D(
-		GL_TEXTURE_2D,
-		0,
-		GL_RGBA,
-		width,
-		height,
-		0,
-		GL_RGBA,
-		GL_UNSIGNED_BYTE,
-		image
-	);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -488,137 +500,190 @@ GLuint loadPNGTexture(const std::string& path)
 	return texture;
 }
 
-void drawFace(
-	GLuint program,
-	GLuint vao,
-	GLuint vbo,
-	GLuint texture,
-	Vec3 eye,
-	Vec3 worldPosition,
-	const float* view,
-	const float* projection,
-	float width,
-	float height,
-	float alpha
-)
+// ---------------------------------------------------------------------------------------------
+// Statistics of the frame (efficiency): the number of draw calls and triangles that were sent to the GPU
+// ---------------------------------------------------------------------------------------------
+int drawCalls = 0;
+int drawnTriangles = 0;
 
+// ---------------------------------------------------------------------------------------------
+// LIGHTING AND SHADOWS - settings that can be changed while the program works
+// ---------------------------------------------------------------------------------------------
+struct LightingSettings
 {
-	Vec3 center = worldPosition;
+	// Flashlight (spotlight)
+	bool flashlightOn;
+	float intensity;          // brightness of the flashlight
+	float outerDeg;           // angle of the outer cone (the light goes to 0 here)
+	float spotExponent;       // the shape of the edge of the cone: 1 = linear, bigger = more narrow
+	// Shadow mapping
+	bool shadowsOn;
+	int shadowSize;           // the depth texture is shadowSize x shadowSize
+	int pcfRadius;            // 0 = hard shadow (1 lookup), 1 = 3 x 3 lookups, 2 = 5 x 5 lookups
+	float shadowBias;         // constant part of the depth bias
+	// Fog and visibility
+	bool fogOn;
+	int fogMode;              // 0 = linear, 1 = exponential, 2 = Gaussian
+	bool fogScatter;          // the fog shines where the flashlight lights it
+	// Other
+	bool dustOn;
+	bool multisample;
+	int debugView;            // 0 = final image, 1 = shadows, 2 = light, 3 = fog
+};
 
-	Vec3 faceRight = makeVec(1.0f, 0.0f, 0.0f);
-	Vec3 faceUp = makeVec(0.0f, 1.0f, 0.0f);
+LightingSettings lighting;
 
-	Vec3 halfRight = scale(faceRight, width * 0.5f);
-	Vec3 halfUp = scale(faceUp, height * 0.5f);
+const int SHADOW_SIZES[4] = { 512, 1024, 2048, 4096 };
+const char* FOG_NAMES[3] = { "Linear", "Exp", "Gauss" };
+const char* VIEW_NAMES[4] = { "Final", "Shadow", "Light", "Fog" };
 
-	Vec3 bottomLeft = add(add(center, scale(halfRight, -1.0f)), scale(halfUp, -1.0f));
-	Vec3 bottomRight = add(add(center, halfRight), scale(halfUp, -1.0f));
-	Vec3 topRight = add(add(center, halfRight), halfUp);
-	Vec3 topLeft = add(add(center, scale(halfRight, -1.0f)), halfUp);
-
-	float vertices[] =
-	{
-		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
-		bottomRight.x, bottomRight.y, bottomRight.z, 1.0f, 0.0f,
-		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
-
-		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
-		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
-		topLeft.x, topLeft.y, topLeft.z, 0.0f, 1.0f
-	};
-
-	glUseProgram(program);
-
-	glUniformMatrix4fv(
-		glGetUniformLocation(program, "uView"),
-		1, GL_FALSE, view
-	);
-
-	glUniformMatrix4fv(
-		glGetUniformLocation(program, "uProjection"),
-		1, GL_FALSE, projection
-	);
-
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, texture);
-
-	glUniform1i(
-		glGetUniformLocation(program, "uFaceTexture"),
-		0
-	);
-
-	glUniform1f(
-		glGetUniformLocation(program, "uFaceAlpha"),
-		alpha
-	);
-
-	glBindVertexArray(vao);
-	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-
-	glBufferSubData(
-		GL_ARRAY_BUFFER,
-		0,
-		sizeof(vertices),
-		vertices
-	);
-
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-	glDepthMask(GL_FALSE);
-
-	glDrawArrays(GL_TRIANGLES, 0, 6);
-
-	glDepthMask(GL_TRUE);
-	glDisable(GL_BLEND);
-
-	glBindVertexArray(0);
+void resetLighting()
+{
+	lighting.flashlightOn = true;
+	lighting.intensity = 2.6f;
+	lighting.outerDeg = FLASH_OUTER_DEG;
+	lighting.spotExponent = 1.5f;
+	lighting.shadowsOn = true;
+	lighting.shadowSize = 2048;
+	lighting.pcfRadius = 1;
+	lighting.shadowBias = 0.0003f;
+	lighting.fogOn = true;
+	lighting.fogMode = 2;
+	lighting.fogScatter = true;
+	lighting.dustOn = true;
+	lighting.multisample = true;
+	lighting.debugView = 0;
 }
 
-void playHorrorSound()
+// The atmosphere depends on the depth: the deeper the player, the thicker and colder the fog
+struct Atmosphere
 {
-	PlaySound(
-		TEXT("assets/audio/gloomy_demonic_drone.wav"),
-		NULL,
-		SND_FILENAME | SND_ASYNC | SND_NODEFAULT
-	);
+	float depthFactor;        // 0 = the top of the stairwell, 1 = very deep
+	float fogDensity;
+	float fogColor[3];
+	float coldLightFactor;
+};
+
+Atmosphere computeAtmosphere(float depth)
+{
+	Atmosphere a;
+	a.depthFactor = clampValue((depth - 20.0f) / 20.0f, 0.0f, 1.0f);
+	a.fogDensity = 0.20f + 0.15f * a.depthFactor;
+	a.fogColor[0] = 0.004f + 0.015f * a.depthFactor;
+	a.fogColor[1] = 0.005f + 0.025f * a.depthFactor;
+	a.fogColor[2] = 0.007f + 0.055f * a.depthFactor;
+	a.coldLightFactor = clampValue((depth - 35.0f) / 15.0f, 0.0f, 1.0f);
+	return a;
 }
 
+// Everything that the shaders need to know about the light in the current frame
+struct FrameLight
+{
+	float lightVP[16];             // flashlight view and projection (world -> light clip space)
+	Vec3 flashWorldPosition;
+	Vec3 flashEyePosition;         // the same point and the direction in the camera (eye) coordinates
+	Vec3 flashEyeDirection;
+	float flashIntensity;
+	float attenuation[3];          // a, b, c of the distance term 1 / (a + b * d + c * d * d)
+	float shadowTexelScale;        // size of one shadow map texel at the distance 1 from the flashlight
+	float fogDensity;
+	float fogColor[3];
+};
+
+// ---------------------------------------------------------------------------------------------
 // Shaders. All the lighting is calculated per fragment (Phong shading) in the camera (eye) coordinates
+// ---------------------------------------------------------------------------------------------
 
-const char* faceVertexShaderCode = R"GLSL(
-layout (location = 0) in vec3 vPosition;
-layout (location = 1) in vec2 vUV;
+// This code is used by the fragment shader of the scene and by the fragment shader of the dust:
+// the spotlight, the shadow test and the fog are written only once
+const char* lightingSharedCode = R"GLSL(
+// Shadow map: a depth texture with the hardware depth compare
+uniform sampler2DShadow uShadowMap;
+uniform bool uUseShadow;
+uniform int uPcfRadius;
+uniform float uShadowBias;
 
-uniform mat4 uView;
-uniform mat4 uProjection;
+// The flashlight is a spotlight, its position and direction are in the eye coordinates
+uniform bool uFlashlightOn;
+uniform vec3 uFlashPosition;
+uniform vec3 uFlashDirection;
+uniform float uFlashInner;
+uniform float uFlashOuter;
+uniform float uFlashIntensity;
+uniform float uSpotExponent;
+uniform vec3 uFlashAttenuation;
+uniform vec3 uFlashColor;
 
-out vec2 fUV;
+// Fog
+uniform bool uUseFog;
+uniform int uFogMode;
+uniform float uFogDensity;
+uniform vec3 uFogColor;
 
-void main()
+// Spotlight: 0 outside the outer cone, 1 inside the inner cone, between them a ramp that is made sharper by the exponent
+// L is the direction from the fragment to the light
+float spotFactor(vec3 L)
 {
-    fUV = vUV;
-    gl_Position = uProjection * uView * vec4(vPosition, 1.0);
+	float theta = dot(-L, uFlashDirection);
+	float ramp = clamp((theta - uFlashOuter) / (uFlashInner - uFlashOuter), 0.0, 1.0);
+	return pow(ramp, uSpotExponent);
 }
-)GLSL";
 
-const char* faceFragmentShaderCode = R"GLSL(
-in vec2 fUV;
-out vec4 FragColor;
-
-uniform sampler2D uFaceTexture;
-
-uniform float uFaceAlpha;
-
-void main()
+// Distance term 1 / (a + b * d + c * d * d)
+float flashAttenuation(float d)
 {
-    vec4 face = texture(uFaceTexture, fUV);
+	return 1.0 / (uFlashAttenuation.x + uFlashAttenuation.y * d + uFlashAttenuation.z * d * d);
+}
 
-    if (face.a < 0.05)
-        discard;
+// Shadow mapping: compares the depth of the fragment with the depth that the flashlight has seen
+// With PCF the neighbour texels are also used, every lookup is already filtered by the hardware
+// The result is 1 in the light and 0 in the shadow
+float shadowFactor(vec4 shadowCoord, float cosTheta)
+{
+	if (!uUseShadow || shadowCoord.w <= 0.0)
+	{
+		return 1.0;
+	}
+	vec3 p = shadowCoord.xyz / shadowCoord.w;
+	p = p * 0.5 + 0.5;
+	if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0)
+	{
+		return 1.0;
+	}
+	// The bias is bigger on the surfaces that are almost parallel to the light rays
+	float bias = uShadowBias * (1.0 + 2.0 * (1.0 - cosTheta));
+	vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
+	float lit = 0.0;
+	for (int x = -uPcfRadius; x <= uPcfRadius; x++)
+	{
+		for (int y = -uPcfRadius; y <= uPcfRadius; y++)
+		{
+			lit += textureLod(uShadowMap, vec3(p.xy + vec2(x, y) * texel, p.z - bias), 0.0);
+		}
+	}
+	float taps = float((2 * uPcfRadius + 1) * (2 * uPcfRadius + 1));
+	return lit / taps;
+}
 
-    face.a *= uFaceAlpha;
-	FragColor = face;
+// Fog: the visibility is 1 near the camera and goes to 0 far away. The color of the pixel is
+// visibility * color + (1 - visibility) * fog color
+float fogVisibility(float d)
+{
+	if (uFogMode == 0)
+	{
+		// Linear (depth cueing)
+		float fogEnd = 2.5 / uFogDensity;
+		float fogStart = 0.15 / uFogDensity;
+		return clamp((fogEnd - d) / (fogEnd - fogStart), 0.0, 1.0);
+	}
+	if (uFogMode == 1)
+	{
+		// Exponential
+		return exp(-d * uFogDensity);
+	}
+	// Gaussian
+	float x = d * uFogDensity;
+	return exp(-x * x);
 }
 )GLSL";
 
@@ -632,6 +697,9 @@ uniform mat4 uModel;
 uniform mat4 uView;
 uniform mat4 uProjection;
 uniform mat4 uLightVP;
+uniform vec3 uLightWorldPosition;
+uniform float uNormalOffset;
+uniform float uShadowTexelScale;
 out vec3 fPositionEye;
 out vec3 fNormalEye;
 out vec2 fUV;
@@ -646,7 +714,12 @@ void main()
 	fNormalEye = mat3(uView) * vNormal;
 	fUV = vUV;
 	fMaterial = vMaterial;
-	fShadowCoord = uLightVP * worldPosition;
+
+	// Normal offset: the point is moved a little along its normal before the shadow test, so the surface does not
+	// shadow itself. The shadow texels get bigger with the distance, so the offset also gets bigger
+	float lightDistance = length(worldPosition.xyz - uLightWorldPosition);
+	vec3 shadowPoint = worldPosition.xyz + vNormal * (uNormalOffset * uShadowTexelScale * lightDistance);
+	fShadowCoord = uLightVP * vec4(shadowPoint, 1.0);
 	gl_Position = uProjection * eyePosition;
 }
 )GLSL";
@@ -662,19 +735,9 @@ out vec4 FragColor;
 
 uniform sampler2D uTexConcrete;
 uniform sampler2D uTexMetal;
-uniform sampler2DShadow uShadowMap;
 uniform bool uUseTexture;
-uniform bool uUseShadow;
-uniform bool uUseFog;
-uniform float uShadowBias;
-
-// The flashlight is a spotlight, its position and direction are in the eye coordinates
-uniform bool uFlashlightOn;
-uniform vec3 uFlashPosition;
-uniform vec3 uFlashDirection;
-uniform float uFlashInner;
-uniform float uFlashOuter;
-uniform float uFlashIntensity;
+uniform bool uFogScatter;
+uniform int uDebugView;
 
 // The lamps are point lights without shadows
 uniform int uLampCount;
@@ -685,9 +748,6 @@ uniform float uLampLevel[4];
 // The glow of the body of the lamp of the floor that is drawn now
 uniform float uGlowLevel;
 uniform vec3 uGlowColor;
-
-uniform float uFogDensity;
-uniform vec3 uFogColor;
 
 uniform float uSceneBrightness;
 
@@ -704,34 +764,6 @@ vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 specularColor, float s
 	return diffuse * albedo + specular * specularColor;
 }
 
-// Shadow mapping: compares the depth of the fragment with the depth that the flashlight has seen
-// The 3x3 neighbour texels are used (PCF), every lookup is already filtered by the hardware
-float shadowFactor(float cosTheta)
-{
-	if (!uUseShadow || fShadowCoord.w <= 0.0)
-	{
-		return 1.0;
-	}
-	vec3 p = fShadowCoord.xyz / fShadowCoord.w;
-	p = p * 0.5 + 0.5;
-	if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0)
-	{
-		return 1.0;
-	}
-	// The bias is bigger on the surfaces that are almost parallel to the light rays
-	float bias = uShadowBias * (1.0 + 2.0 * (1.0 - cosTheta));
-	vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
-	float lit = 0.0;
-	for (int x = -1; x <= 1; x++)
-	{
-		for (int y = -1; y <= 1; y++)
-		{
-			lit += textureLod(uShadowMap, vec3(p.xy + vec2(x, y) * texel, p.z - bias), 0.0);
-		}
-	}
-	return lit / 9.0;
-}
-
 void main()
 {
 	// Both textures are always read (it is safe for the mipmap levels), the material chooses one of them
@@ -740,6 +772,11 @@ void main()
 	vec3 N = normalize(fNormalEye);
 	vec3 V = normalize(-fPositionEye);
 	vec3 color;
+
+	// Numbers for the debug views
+	float debugShadow = 1.0;
+	float debugLight = 0.0;
+	float flashAmount = 0.0;
 
 	if (fMaterial > 1.5)
 	{
@@ -772,14 +809,13 @@ void main()
 			vec3 toLight = uFlashPosition - fPositionEye;
 			float d = length(toLight);
 			vec3 L = toLight / d;
-			// Spotlight: full light inside the inner cone, a soft edge between the inner and the outer cone
-			float theta = dot(-L, uFlashDirection);
-			float spot = clamp((theta - uFlashOuter) / (uFlashInner - uFlashOuter), 0.0, 1.0);
-			// Distance term 1 / (a + b * d + c * d * d)
-			float attenuation = 1.0 / (1.0 + 0.09 * d + 0.032 * d * d);
-			float shadow = shadowFactor(max(dot(N, L), 0.0));
-			vec3 flashColor = vec3(1.0, 0.94, 0.80);
-			color += blinnPhong(N, V, L, albedo, specularColor, shininess) * flashColor * (uFlashIntensity * attenuation * spot * shadow);
+			float spot = spotFactor(L);
+			float attenuation = flashAttenuation(d);
+			float shadow = shadowFactor(fShadowCoord, max(dot(N, L), 0.0));
+			flashAmount = uFlashIntensity * attenuation * spot;
+			debugShadow = shadow;
+			debugLight = flashAmount * max(dot(N, L), 0.0) * shadow;
+			color += blinnPhong(N, V, L, albedo, specularColor, shininess) * uFlashColor * (flashAmount * shadow);
 		}
 
 		for (int i = 0; i < uLampCount; i++)
@@ -792,16 +828,41 @@ void main()
 		}
 	}
 
-	// Gaussian fog: the farther the fragment, the more it gets the color of the fog
+	// Fog: the farther the fragment, the more it gets the color of the fog
+	float visibility = 1.0;
 	if (uUseFog)
 	{
-		float x = length(fPositionEye) * uFogDensity;
-		float fogAmount = exp(-x * x);
-		color = mix(uFogColor, color, fogAmount);
+		visibility = fogVisibility(length(fPositionEye));
+		vec3 fogColor = uFogColor;
+		// Light scattering: the fog shines a little where the cone of the flashlight goes through it
+		if (uFogScatter && uFlashlightOn)
+		{
+			fogColor += uFlashColor * (0.12 * flashAmount);
+		}
+		color = mix(fogColor, color, visibility);
 	}
 
-	// Apply global scene brightness
+	// Debug views: only one number is shown as gray
+	if (uDebugView == 1)
+	{
+		float inCone = (flashAmount > 0.0) ? 1.0 : 0.15;
+		FragColor = vec4(vec3(debugShadow * inCone), 1.0);
+		return;
+	}
+	if (uDebugView == 2)
+	{
+		FragColor = vec4(vec3(clamp(debugLight, 0.0, 1.0)), 1.0);
+		return;
+	}
+	if (uDebugView == 3)
+	{
+		FragColor = vec4(vec3(visibility), 1.0);
+		return;
+	}
+
+	// Global brightness (it is used by the events), a too bright pixel is cut to 1
 	color *= uSceneBrightness;
+	color = min(color, vec3(1.0));
 
 	// Back to the sRGB space
 	color = pow(color, vec3(1.0 / 2.2));
@@ -826,17 +887,112 @@ void main()
 }
 )GLSL";
 
-//shader load
-GLuint compileShader(GLenum type, const char* code)
+// Dust: every particle is a point. It is visible only where the flashlight lights it (and the shadows are used too)
+const char* dustVertexShaderCode = R"GLSL(
+layout (location = 0) in vec3 pWorld;
+layout (location = 1) in vec2 pData;
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform mat4 uLightVP;
+uniform float uPointScale;
+out vec3 fPositionEye;
+out float fAlpha;
+out vec4 fShadowCoord;
+void main()
 {
-	// shader = version line + code of stage
+	vec4 eyePosition = uView * vec4(pWorld, 1.0);
+	fPositionEye = eyePosition.xyz;
+	fAlpha = pData.y;
+	fShadowCoord = uLightVP * vec4(pWorld, 1.0);
+	gl_Position = uProjection * eyePosition;
+	// The size in pixels is the size in meters divided by the distance
+	float dist = max(-eyePosition.z, 0.1);
+	gl_PointSize = clamp(pData.x * uPointScale / dist, 1.0, 14.0);
+}
+)GLSL";
+
+const char* dustFragmentShaderCode = R"GLSL(
+in vec3 fPositionEye;
+in float fAlpha;
+in vec4 fShadowCoord;
+out vec4 FragColor;
+uniform float uSceneBrightness;
+void main()
+{
+	// A soft round point
+	vec2 c = gl_PointCoord * 2.0 - 1.0;
+	float r2 = dot(c, c);
+	if (r2 > 1.0)
+	{
+		discard;
+	}
+	float brightness = 0.0;
+	if (uFlashlightOn)
+	{
+		vec3 toLight = uFlashPosition - fPositionEye;
+		float d = length(toLight);
+		brightness = spotFactor(toLight / d) * flashAttenuation(d) * uFlashIntensity * shadowFactor(fShadowCoord, 1.0);
+	}
+	float distanceToEye = length(fPositionEye);
+	float visibility = 1.0;
+	if (uUseFog)
+	{
+		visibility = fogVisibility(distanceToEye);
+	}
+	// The dust very close to the eye fades out, otherwise it would be a big spot
+	float nearFade = smoothstep(0.3, 1.0, distanceToEye);
+	float alpha = (1.0 - r2) * fAlpha * nearFade * visibility * clamp(brightness, 0.0, 1.0);
+	vec3 color = pow(uFlashColor * uSceneBrightness, vec3(1.0 / 2.2));
+	FragColor = vec4(color, alpha);
+}
+)GLSL";
+
+// The billboard of the face (it is drawn without the lighting)
+const char* faceVertexShaderCode = R"GLSL(
+layout (location = 0) in vec3 vPosition;
+layout (location = 1) in vec2 vUV;
+
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+out vec2 fUV;
+
+void main()
+{
+	fUV = vUV;
+	gl_Position = uProjection * uView * vec4(vPosition, 1.0);
+}
+)GLSL";
+
+const char* faceFragmentShaderCode = R"GLSL(
+in vec2 fUV;
+out vec4 FragColor;
+
+uniform sampler2D uFaceTexture;
+uniform float uFaceAlpha;
+
+void main()
+{
+	vec4 face = texture(uFaceTexture, fUV);
+
+	if (face.a < 0.05)
+		discard;
+
+	face.a *= uFaceAlpha;
+	FragColor = face;
+}
+)GLSL";
+
+GLuint compileShader(GLenum type, const std::string& code)
+{
+	// The shader is the version line + the code of this stage
 	std::string source = std::string("#version 330 core\n") + code;
 	const char* sourcePointer = source.c_str();
 	GLuint shader = glCreateShader(type);
 	glShaderSource(shader, 1, &sourcePointer, NULL);
 	glCompileShader(shader);
 
-	// error
+	// Print the error if the shader does not compile
 	GLint success;
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
 	if (!success)
@@ -848,9 +1004,9 @@ GLuint compileShader(GLenum type, const char* code)
 	return shader;
 }
 
-GLuint createShaderProgram(const char* vertexCode, const char* fragmentCode)
+GLuint createShaderProgram(const std::string& vertexCode, const std::string& fragmentCode)
 {
-	// Compile both shaders + link them into one Shader Program
+	// Compile both shaders and link them into one Shader Program
 	GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexCode);
 	GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentCode);
 	GLuint program = glCreateProgram();
@@ -867,20 +1023,29 @@ GLuint createShaderProgram(const char* vertexCode, const char* fragmentCode)
 		std::cout << "Program error: " << log << std::endl;
 	}
 
-	// shader objects arent needed after linking
+	// The shader objects are not needed after linking
 	glDeleteShader(vertexShader);
 	glDeleteShader(fragmentShader);
 	return program;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Shadow map: a depth texture that is attached to a frame buffer object (FBO), the scene is rendered into it
+// ---------------------------------------------------------------------------------------------
+GLuint shadowFramebuffer = 0;
+GLuint shadowTexture = 0;
 
-
-// The shadow map is a depth texture that is attached to a frame buffer object (FBO), the scene is rendered into it
-void createShadowMap(GLuint& framebuffer, GLuint& depthTexture)
+void allocateShadowTexture(int size)
 {
-	glGenTextures(1, &depthTexture);
-	glBindTexture(GL_TEXTURE_2D, depthTexture);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+	glBindTexture(GL_TEXTURE_2D, shadowTexture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, size, size, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+}
+
+void createShadowMap()
+{
+	glGenTextures(1, &shadowTexture);
+	glBindTexture(GL_TEXTURE_2D, shadowTexture);
+	allocateShadowTexture(lighting.shadowSize);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	// Outside of the map everything is lit (the depth 1.0 is the far plane)
@@ -892,9 +1057,9 @@ void createShadowMap(GLuint& framebuffer, GLuint& depthTexture)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
 
-	glGenFramebuffers(1, &framebuffer);
-	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthTexture, 0);
+	glGenFramebuffers(1, &shadowFramebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, shadowFramebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowTexture, 0);
 	// There is no color buffer in this frame buffer
 	glDrawBuffer(GL_NONE);
 	glReadBuffer(GL_NONE);
@@ -905,9 +1070,127 @@ void createShadowMap(GLuint& framebuffer, GLuint& depthTexture)
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+void setShadowMapSize(int size)
+{
+	// The texture gets a new size, the frame buffer object keeps using the same texture
+	lighting.shadowSize = size;
+	allocateShadowTexture(size);
+}
+
+GLint uniformLocation(GLuint program, const char* name)
+{
+	return glGetUniformLocation(program, name);
+}
+
+// Sends the light, the shadow and the fog to a shader program (it is used for the scene and for the dust)
+void uploadLightingUniforms(GLuint program, const FrameLight& frame, bool shadowActive)
+{
+	glUniformMatrix4fv(uniformLocation(program, "uLightVP"), 1, GL_FALSE, frame.lightVP);
+	glUniform3f(uniformLocation(program, "uLightWorldPosition"), frame.flashWorldPosition.x, frame.flashWorldPosition.y, frame.flashWorldPosition.z);
+
+	// Flashlight. The cones are sent as cosines, so the shader does not need the angles
+	float inner = lighting.outerDeg * FLASH_INNER_RATIO;
+	glUniform1i(uniformLocation(program, "uFlashlightOn"), lighting.flashlightOn ? 1 : 0);
+	glUniform3f(uniformLocation(program, "uFlashPosition"), frame.flashEyePosition.x, frame.flashEyePosition.y, frame.flashEyePosition.z);
+	glUniform3f(uniformLocation(program, "uFlashDirection"), frame.flashEyeDirection.x, frame.flashEyeDirection.y, frame.flashEyeDirection.z);
+	glUniform1f(uniformLocation(program, "uFlashInner"), cosf(inner * PI / 180.0f));
+	glUniform1f(uniformLocation(program, "uFlashOuter"), cosf(lighting.outerDeg * PI / 180.0f));
+	glUniform1f(uniformLocation(program, "uFlashIntensity"), frame.flashIntensity);
+	glUniform1f(uniformLocation(program, "uSpotExponent"), lighting.spotExponent);
+	glUniform3f(uniformLocation(program, "uFlashAttenuation"), frame.attenuation[0], frame.attenuation[1], frame.attenuation[2]);
+	glUniform3fv(uniformLocation(program, "uFlashColor"), 1, FLASH_COLOR);
+
+	// Shadow map is on the texture unit 2. The normal offset is 1 texel + the radius of the PCF
+	glUniform1i(uniformLocation(program, "uShadowMap"), 2);
+	glUniform1i(uniformLocation(program, "uUseShadow"), shadowActive ? 1 : 0);
+	glUniform1i(uniformLocation(program, "uPcfRadius"), lighting.pcfRadius);
+	glUniform1f(uniformLocation(program, "uShadowBias"), lighting.shadowBias);
+	glUniform1f(uniformLocation(program, "uNormalOffset"), 1.0f + (float)lighting.pcfRadius);
+	glUniform1f(uniformLocation(program, "uShadowTexelScale"), frame.shadowTexelScale);
+
+	// Fog
+	glUniform1i(uniformLocation(program, "uUseFog"), lighting.fogOn ? 1 : 0);
+	glUniform1i(uniformLocation(program, "uFogMode"), lighting.fogMode);
+	glUniform1f(uniformLocation(program, "uFogDensity"), frame.fogDensity);
+	glUniform3fv(uniformLocation(program, "uFogColor"), 1, frame.fogColor);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dust. A particle system: every particle is born with random attributes, moves by the forces (a small
+// random force, the air drag and a slow fall), and dies when it is too old or leaves the stairwell
+// ---------------------------------------------------------------------------------------------
+struct Dust
+{
+	Vec3 position;
+	Vec3 velocity;
+	float size;      // in meters
+	float age;
+	float life;
+};
+
+Dust dust[DUST_COUNT];
+float dustData[DUST_COUNT * 5];   // for every particle: position (3), size and alpha (2)
+
+void spawnDust(Dust& d, float centerY, bool randomAge)
+{
+	d.position = makeVec(randomRange(-HALF_X + 0.1f, HALF_X - 0.1f), centerY + randomRange(-DUST_RANGE_Y, DUST_RANGE_Y), randomRange(-HALF_Z + 0.1f, HALF_Z - 0.1f));
+	d.velocity = makeVec(randomRange(-0.03f, 0.03f), randomRange(-0.06f, 0.0f), randomRange(-0.03f, 0.03f));
+	d.size = randomRange(0.012f, 0.03f);
+	d.life = randomRange(6.0f, 14.0f);
+	d.age = randomAge ? randomRange(0.0f, d.life) : 0.0f;
+}
+
+void initDust(float centerY)
+{
+	for (int i = 0; i < DUST_COUNT; i++)
+	{
+		spawnDust(dust[i], centerY, true);
+	}
+}
+
+void shiftDust(float dy)
+{
+	// When the player is moved by the loop, the dust is moved with him
+	for (int i = 0; i < DUST_COUNT; i++)
+	{
+		dust[i].position.y += dy;
+	}
+}
+
+void updateDust(float seconds, float centerY)
+{
+	for (int i = 0; i < DUST_COUNT; i++)
+	{
+		Dust& d = dust[i];
+		d.age += seconds;
+
+		// Force: a random push of the air, then the air drag (the velocity gets smaller)
+		Vec3 push = makeVec(randomRange(-1.0f, 1.0f), randomRange(-1.0f, 1.0f), randomRange(-1.0f, 1.0f));
+		d.velocity = add(d.velocity, scale(push, seconds));
+		d.velocity = scale(d.velocity, 1.0f - clampValue(0.8f * seconds, 0.0f, 1.0f));
+		d.position = add(d.position, scale(d.velocity, seconds));
+
+		// Extinction: too old, or outside of the stairwell, or too far from the player
+		bool outside = fabsf(d.position.x) > HALF_X || fabsf(d.position.z) > HALF_Z || fabsf(d.position.y - centerY) > DUST_RANGE_Y + 0.5f;
+		if (d.age > d.life || outside)
+		{
+			spawnDust(d, centerY, false);
+		}
+
+		// The particle fades in and fades out during one second
+		float fade = clampValue(fminf(d.age, d.life - d.age), 0.0f, 1.0f);
+		dustData[i * 5] = d.position.x;
+		dustData[i * 5 + 1] = d.position.y;
+		dustData[i * 5 + 2] = d.position.z;
+		dustData[i * 5 + 3] = d.size;
+		dustData[i * 5 + 4] = fade;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
 // Light sources with a random flicker. Every light has a timer: it is steady for some seconds,
 // then it flickers for a short time (the level jumps between dark and bright), then it is steady again
-
+// ---------------------------------------------------------------------------------------------
 struct Lamp
 {
 	bool exists;
@@ -994,12 +1277,12 @@ void initLamps()
 		initLamp(lamps[i], (i % 3) != 2, 2.0f, 7.0f, LAMP_COLORS[i % 3]);
 	}
 	// The flashlight has its own timer, it flickers rarely
-	const float flashColor[3] = { 1.0f, 0.94f, 0.80f };
-	initLamp(flashlight, true, 8.0f, 20.0f, flashColor);
+	initLamp(flashlight, true, 8.0f, 20.0f, FLASH_COLOR);
 }
 
-// зlayer + camera + the loop of the floors
-
+// ---------------------------------------------------------------------------------------------
+// Player, camera and the loop of the floors
+// ---------------------------------------------------------------------------------------------
 GLFWwindow* window;
 int windowWidth = 1280;
 int windowHeight = 720;
@@ -1029,18 +1312,22 @@ Vec3 faceAttackDirection;
 
 float faceAttackProgress = 0.0f;
 
-float faceWorldY = -51.0f;
 const float FACE_DEPTH = 51.0f;
 const float FACE_X = 0.0f;
 const float FACE_Z = HALF_Z - 0.05f;
 int wrapCount = 0;           // times player moved back by the loop
-bool flashlightOn = true;
 bool useTexture = true;
-bool useShadow = true;
-bool useFog = true;
 bool firstMouse = true;
 double lastMouseX = 0.0;
 double lastMouseY = 0.0;
+
+// The direction of the flashlight follows the direction of the head with a small delay
+Vec3 flashDirection;
+
+Vec3 viewDirection()
+{
+	return makeVec(cosf(pitch) * sinf(yaw), sinf(pitch), -cosf(pitch) * cosf(yaw));
+}
 
 void resetPlayer()
 {
@@ -1053,11 +1340,12 @@ void resetPlayer()
 	pitch = -0.15f;
 	totalDescent = 0.0f;
 	wrapCount = 0;
+	flashDirection = viewDirection();
 }
 
 bool canStand(float x, float z)
 {
-	// player cant go through the walls or into the open well
+	// The player cant go through the walls or into the open well
 	if (fabsf(x) > HALF_X - PLAYER_RADIUS || fabsf(z) > HALF_Z - PLAYER_RADIUS)
 	{
 		return false;
@@ -1069,7 +1357,8 @@ bool canStand(float x, float z)
 	return true;
 }
 
-// height of the floor under the point
+// The height of the floor under the point (x, z). The floors repeat every FLOOR_HEIGHT, so the point has many
+// possible heights. The highest one that the player can step on is taken
 float groundHeight(float x, float z, float currentFeetY)
 {
 	float h0;
@@ -1100,7 +1389,7 @@ float groundHeight(float x, float z, float currentFeetY)
 
 void updatePlayer(float seconds)
 {
-	// walking directions on the floor + the pitch is ignored
+	// The walking directions on the floor, the pitch is ignored
 	Vec3 forward = makeVec(sinf(yaw), 0.0f, -cosf(yaw));
 	Vec3 right = makeVec(cosf(yaw), 0.0f, sinf(yaw));
 	Vec3 wish = makeVec(0.0f, 0.0f, 0.0f);
@@ -1115,19 +1404,20 @@ void updatePlayer(float seconds)
 		speed = RUN_SPEED;
 	}
 
-	// X and Z are tried separately
+	// X and Z are tried separately, so the player slides along the walls
 	float newX = playerX + wish.x * speed * seconds;
 	if (canStand(newX, playerZ)) playerX = newX;
 	float newZ = playerZ + wish.z * speed * seconds;
 	if (canStand(playerX, newZ)) playerZ = newZ;
 
-	// feet follow the steps + camera follows the feet later
+	// The feet follow the steps, the camera follows the feet a bit later, so the walk on the stairs is smooth
 	float oldFeetY = feetY;
 	feetY = groundHeight(playerX, playerZ, feetY);
 	totalDescent += oldFeetY - feetY;
 	cameraY += (feetY + EYE_HEIGHT - cameraY) * clampValue(12.0f * seconds, 0.0f, 1.0f);
 
-	// The loop
+	// The loop: the world has the same look every LOOP_FLOORS floors, so the player is moved by exactly
+	// this height and nothing changes on the screen
 	float loopLength = LOOP_FLOORS * FLOOR_HEIGHT;
 	if (feetY < -loopLength)
 	{
@@ -1143,32 +1433,83 @@ void updatePlayer(float seconds)
 	}
 }
 
-// input
-
+// ---------------------------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------------------------
 void updateTitle(float fps)
 {
-	// window title is the HUD -> floor, depth, loops, FPS and the state of the effects
+	// The window title is the HUD: floor, depth, FPS, the efficiency numbers and the state of the effects
 	int floorNumber = (int)floorf(totalDescent / FLOOR_HEIGHT);
-	char title[200];
-	snprintf(title, sizeof(title), "SCP-087 | Floor %d | Depth %.1f m | Loops %d | %.0f FPS | Light %s | Tex %s | Shadow %s | Fog %s",
-		floorNumber, totalDescent, wrapCount, fps, flashlightOn ? "on" : "off", useTexture ? "on" : "off", useShadow ? "on" : "off", useFog ? "on" : "off");
+	int kernel = 2 * lighting.pcfRadius + 1;
+	char title[400];
+	snprintf(title, sizeof(title),
+		"SCP-087 | Floor %d | %.1f m | %.0f FPS %.1f ms | %d draws %d tris | Light %s %.0f deg x%.1f | Shadow %s %d px PCF %dx%d | Fog %s %s | Dust %s | MSAA %s | View %s",
+		floorNumber, totalDescent, fps, fps > 0.0f ? 1000.0f / fps : 0.0f, drawCalls, drawnTriangles,
+		lighting.flashlightOn ? "on" : "off", lighting.outerDeg, lighting.intensity,
+		lighting.shadowsOn ? "on" : "off", lighting.shadowSize, kernel, kernel,
+		lighting.fogOn ? "on" : "off", FOG_NAMES[lighting.fogMode], lighting.dustOn ? "on" : "off",
+		lighting.multisample ? "on" : "off", VIEW_NAMES[lighting.debugView]);
 	glfwSetWindowTitle(window, title);
+}
+
+void printLighting()
+{
+	// All the numbers of the lighting part, for the experiments and for the report
+	std::cout << "Flashlight: " << (lighting.flashlightOn ? "on" : "off") << ", cone " << lighting.outerDeg << " deg (inner "
+		<< lighting.outerDeg * FLASH_INNER_RATIO << "), intensity " << lighting.intensity << ", exponent " << lighting.spotExponent << std::endl;
+	std::cout << "Shadows: " << (lighting.shadowsOn ? "on" : "off") << ", map " << lighting.shadowSize << " x " << lighting.shadowSize
+		<< ", PCF " << 2 * lighting.pcfRadius + 1 << " x " << 2 * lighting.pcfRadius + 1 << ", bias " << lighting.shadowBias << std::endl;
+	std::cout << "Fog: " << (lighting.fogOn ? "on" : "off") << ", " << FOG_NAMES[lighting.fogMode] << ", scattering "
+		<< (lighting.fogScatter ? "on" : "off") << ", depth " << totalDescent << " m" << std::endl;
 }
 
 void keyCallback(GLFWwindow* w, int key, int scancode, int action, int mods)
 {
-	// keys work one per press
+	if (action == GLFW_RELEASE)
+	{
+		return;
+	}
+
+	// These keys also work when they are held (a repeated action)
+	if (key == GLFW_KEY_LEFT_BRACKET) lighting.outerDeg = clampValue(lighting.outerDeg - 1.0f, 12.0f, 45.0f);
+	else if (key == GLFW_KEY_RIGHT_BRACKET) lighting.outerDeg = clampValue(lighting.outerDeg + 1.0f, 12.0f, 45.0f);
+	else if (key == GLFW_KEY_MINUS) lighting.intensity = clampValue(lighting.intensity - 0.2f, 0.4f, 8.0f);
+	else if (key == GLFW_KEY_EQUAL) lighting.intensity = clampValue(lighting.intensity + 0.2f, 0.4f, 8.0f);
+	else if (key == GLFW_KEY_COMMA) lighting.shadowBias = clampValue(lighting.shadowBias - 0.0001f, 0.0f, 0.01f);
+	else if (key == GLFW_KEY_PERIOD) lighting.shadowBias = clampValue(lighting.shadowBias + 0.0001f, 0.0f, 0.01f);
+
+	// The other keys work once for every press
 	if (action != GLFW_PRESS)
 	{
 		return;
 	}
 	if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
-	else if (key == GLFW_KEY_F) flashlightOn = !flashlightOn;
+	else if (key == GLFW_KEY_F) lighting.flashlightOn = !lighting.flashlightOn;
 	else if (key == GLFW_KEY_T) useTexture = !useTexture;
-	else if (key == GLFW_KEY_H) useShadow = !useShadow;
-	else if (key == GLFW_KEY_G) useFog = !useFog;
+	else if (key == GLFW_KEY_H) lighting.shadowsOn = !lighting.shadowsOn;
+	else if (key == GLFW_KEY_G) lighting.fogOn = !lighting.fogOn;
 	else if (key == GLFW_KEY_B) flickerEnabled = !flickerEnabled;
 	else if (key == GLFW_KEY_R) resetPlayer();
+	else if (key == GLFW_KEY_1) lighting.fogMode = 0;
+	else if (key == GLFW_KEY_2) lighting.fogMode = 1;
+	else if (key == GLFW_KEY_3) lighting.fogMode = 2;
+	else if (key == GLFW_KEY_4) lighting.fogScatter = !lighting.fogScatter;
+	else if (key == GLFW_KEY_5) lighting.dustOn = !lighting.dustOn;
+	else if (key == GLFW_KEY_M) lighting.multisample = !lighting.multisample;
+	else if (key == GLFW_KEY_P) lighting.pcfRadius = (lighting.pcfRadius + 1) % 3;
+	else if (key == GLFW_KEY_V) lighting.debugView = (lighting.debugView + 1) % 4;
+	else if (key == GLFW_KEY_O)
+	{
+		// The next size of the shadow map
+		int index = 0;
+		for (int i = 0; i < 4; i++)
+		{
+			if (SHADOW_SIZES[i] == lighting.shadowSize) index = i;
+		}
+		setShadowMapSize(SHADOW_SIZES[(index + 1) % 4]);
+	}
+	else if (key != GLFW_KEY_I) return;
+	printLighting();
 }
 
 void mouseCallback(GLFWwindow* w, double x, double y)
@@ -1199,7 +1540,88 @@ void framebufferSizeCallback(GLFWwindow* w, int width, int height)
 	windowHeight = height;
 }
 
-// Draws same model floors around player
+// ---------------------------------------------------------------------------------------------
+// The face (billboard) and the sound
+// ---------------------------------------------------------------------------------------------
+void drawFace(
+	GLuint program,
+	GLuint vao,
+	GLuint vbo,
+	GLuint texture,
+	Vec3 eye,
+	Vec3 worldPosition,
+	const float* view,
+	const float* projection,
+	float width,
+	float height,
+	float alpha
+)
+{
+	Vec3 center = worldPosition;
+
+	Vec3 faceRight = makeVec(1.0f, 0.0f, 0.0f);
+	Vec3 faceUp = makeVec(0.0f, 1.0f, 0.0f);
+
+	Vec3 halfRight = scale(faceRight, width * 0.5f);
+	Vec3 halfUp = scale(faceUp, height * 0.5f);
+
+	Vec3 bottomLeft = add(add(center, scale(halfRight, -1.0f)), scale(halfUp, -1.0f));
+	Vec3 bottomRight = add(add(center, halfRight), scale(halfUp, -1.0f));
+	Vec3 topRight = add(add(center, halfRight), halfUp);
+	Vec3 topLeft = add(add(center, scale(halfRight, -1.0f)), halfUp);
+
+	float vertices[] =
+	{
+		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
+		bottomRight.x, bottomRight.y, bottomRight.z, 1.0f, 0.0f,
+		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
+
+		bottomLeft.x, bottomLeft.y, bottomLeft.z, 0.0f, 0.0f,
+		topRight.x, topRight.y, topRight.z, 1.0f, 1.0f,
+		topLeft.x, topLeft.y, topLeft.z, 0.0f, 1.0f
+	};
+
+	glUseProgram(program);
+
+	glUniformMatrix4fv(glGetUniformLocation(program, "uView"), 1, GL_FALSE, view);
+	glUniformMatrix4fv(glGetUniformLocation(program, "uProjection"), 1, GL_FALSE, projection);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, texture);
+
+	glUniform1i(glGetUniformLocation(program, "uFaceTexture"), 0);
+	glUniform1f(glGetUniformLocation(program, "uFaceAlpha"), alpha);
+
+	glBindVertexArray(vao);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glDepthMask(GL_FALSE);
+
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+	drawCalls++;
+	drawnTriangles += 2;
+
+	glDepthMask(GL_TRUE);
+	glDisable(GL_BLEND);
+
+	glBindVertexArray(0);
+}
+
+void playHorrorSound()
+{
+#ifdef _WIN32
+	PlaySound(TEXT("assets/audio/gloomy_demonic_drone.wav"), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------------------------
+// Draws all the floors around the player. Every floor is the same model, only the model matrix (a translation)
+// is different. This is the instancing of the lecture about transformations
 void drawFloors(GLuint program, int baseFloor, bool setGlow)
 {
 	GLint modelLocation = glGetUniformLocation(program, "uModel");
@@ -1217,9 +1639,10 @@ void drawFloors(GLuint program, int baseFloor, bool setGlow)
 			glUniform3fv(glowColorLocation, 1, lamp.color);
 		}
 		glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+		drawCalls++;
+		drawnTriangles += vertexCount / 3;
 	}
 }
-
 
 // Takes the nearest lamps from the drawn floors and gives their data to the shader (positions in the eye coordinates)
 int selectLamps(int baseFloor, Vec3 eye, const float* view,
@@ -1253,19 +1676,14 @@ int selectLamps(int baseFloor, Vec3 eye, const float* view,
 		positions[count * 3] = p.x;
 		positions[count * 3 + 1] = p.y;
 		positions[count * 3 + 2] = p.z;
+
 		// Blend the original lamp color with a cold blue tint or with a red tint
 		const float coldColor[3] = { 0.55f, 0.72f, 1.0f };
 		const float redColor[3] = { 1.0f, 0.08f, 0.03f };
-
 		for (int c = 0; c < 3; c++)
 		{
-			float normalColor =
-				lamp.color[c] * (1.0f - coldLightFactor) +
-				coldColor[c] * coldLightFactor;
-
-			colors[count * 3 + c] =
-				normalColor * (1.0f - redLightFactor) +
-				redColor[c] * redLightFactor;
+			float normalColor = lamp.color[c] * (1.0f - coldLightFactor) + coldColor[c] * coldLightFactor;
+			colors[count * 3 + c] = normalColor * (1.0f - redLightFactor) + redColor[c] * redLightFactor;
 		}
 		levels[count] = (depthEventTimer > 0.0f) ? 0.0f : lamp.level;
 		count++;
@@ -1276,13 +1694,11 @@ int selectLamps(int baseFloor, Vec3 eye, const float* view,
 	return count;
 }
 
-
-//opengl setup
 int main(int argc, char** argv)
 {
 	srand((unsigned int)time(NULL));
 
-	// initialize GLFW
+	// Initialize GLFW. On Windows the visible Windows platform is chosen (GLFW 3.4 or newer)
 #ifdef _WIN32
 	glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WIN32);
 #endif
@@ -1291,11 +1707,12 @@ int main(int argc, char** argv)
 		return -1;
 	}
 
-	// Tell GLFW were using OpenGL 3.3 + CORE profile, with a depth buffer
+	// Tell GLFW we are using OpenGL 3.3 with the CORE profile, with a depth buffer and 4 samples per pixel
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_DEPTH_BITS, 24);
+	glfwWindowHint(GLFW_SAMPLES, 4);
 
 	window = glfwCreateWindow(windowWidth, windowHeight, "SCP-087", NULL, NULL);
 	if (window == NULL)
@@ -1313,27 +1730,30 @@ int main(int argc, char** argv)
 	}
 	glfwSwapInterval(1);
 
-	// The window size is asked
+	// The window can be bigger than 1280 x 720 on a screen with scaling, so the real size is asked
 	glfwGetFramebufferSize(window, &windowWidth, &windowHeight);
 
-	// the mouse is hidden + captured, it only turns the head
+	// The mouse is hidden and captured, it only turns the head
 	glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 	glfwSetKeyCallback(window, keyCallback);
 	glfwSetCursorPosCallback(window, mouseCallback);
 	glfwSetScrollCallback(window, scrollCallback);
 	glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
 
-
 	// The depth test makes the nearest triangle visible, the culling skips the back faces
+	// The point size is set by the vertex shader (the dust)
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_CULL_FACE);
+	glEnable(GL_PROGRAM_POINT_SIZE);
 
-	GLuint sceneProgram = createShaderProgram(sceneVertexShaderCode, sceneFragmentShaderCode);
+	resetLighting();
+
+	// The fragment shaders of the scene and of the dust use the same code of the light, the shadow and the fog
+	std::string shared = lightingSharedCode;
+	GLuint sceneProgram = createShaderProgram(sceneVertexShaderCode, shared + sceneFragmentShaderCode);
 	GLuint shadowProgram = createShaderProgram(shadowVertexShaderCode, shadowFragmentShaderCode);
-	GLuint faceProgram = createShaderProgram(
-		faceVertexShaderCode,
-		faceFragmentShaderCode
-	);
+	GLuint dustProgram = createShaderProgram(dustVertexShaderCode, shared + dustFragmentShaderCode);
+	GLuint faceProgram = createShaderProgram(faceVertexShaderCode, faceFragmentShaderCode);
 
 	// Create the model of one floor, the VAO and the VBO
 	buildFloor();
@@ -1353,38 +1773,33 @@ int main(int argc, char** argv)
 	glEnableVertexAttribArray(2);
 	glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(8 * sizeof(float)));
 	glEnableVertexAttribArray(3);
-	// Face billboard geometry
-	GLuint faceVAO, faceVBO;
 
-	float faceVertices[30] = { 0.0f };
-
-	glGenVertexArrays(1, &faceVAO);
-	glGenBuffers(1, &faceVBO);
-
-	glBindVertexArray(faceVAO);
-	glBindBuffer(GL_ARRAY_BUFFER, faceVBO);
-
-	glBufferData(
-		GL_ARRAY_BUFFER,
-		sizeof(faceVertices),
-		faceVertices,
-		GL_DYNAMIC_DRAW
-	);
-
-	// Position: 3 floats
-	glVertexAttribPointer(
-		0, 3, GL_FLOAT, GL_FALSE,
-		5 * sizeof(float), (void*)0
-	);
+	// The dust: a VAO and a dynamic VBO, the data of the particles is sent in every frame
+	GLuint dustVAO, dustVBO;
+	glGenVertexArrays(1, &dustVAO);
+	glGenBuffers(1, &dustVBO);
+	glBindVertexArray(dustVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, dustVBO);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(dustData), NULL, GL_DYNAMIC_DRAW);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
 	glEnableVertexAttribArray(0);
-
-	// Texture coordinates: 2 floats
-	glVertexAttribPointer(
-		1, 2, GL_FLOAT, GL_FALSE,
-		5 * sizeof(float), (void*)(3 * sizeof(float))
-	);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
 	glEnableVertexAttribArray(1);
 
+	// Face billboard geometry
+	GLuint faceVAO, faceVBO;
+	float faceVertices[30] = { 0.0f };
+	glGenVertexArrays(1, &faceVAO);
+	glGenBuffers(1, &faceVBO);
+	glBindVertexArray(faceVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, faceVBO);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(faceVertices), faceVertices, GL_DYNAMIC_DRAW);
+	// Position: 3 floats
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+	glEnableVertexAttribArray(0);
+	// Texture coordinates: 2 floats
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+	glEnableVertexAttribArray(1);
 	glBindVertexArray(0);
 
 	// The textures are made by the program, the shadow map is an empty depth texture
@@ -1393,33 +1808,28 @@ int main(int argc, char** argv)
 	GLuint concreteTexture = createTexture(pixels);
 	makeMetalTexture(pixels);
 	GLuint metalTexture = createTexture(pixels);
-	GLuint shadowFramebuffer, shadowTexture;
-	createShadowMap(shadowFramebuffer, shadowTexture);
-	GLuint faceTexture = loadPNGTexture(
-		"assets/textures/scp_face.png"
-	);
+	createShadowMap();
+	GLuint faceTexture = loadPNGTexture("assets/textures/scp_face.png");
 
 	initLamps();
 	resetPlayer();
-
-	// Fog color in the linear space, the clear color is the same, but in the sRGB space
-	const float fogColor[3] = { 0.004f, 0.005f, 0.007f };
-	float depthFogFactor = 0.0f;
-	float clearColor[3];
-	for (int i = 0; i < 3; i++)
-	{
-		clearColor[i] = powf(fogColor[i], 1.0f / 2.2f);
-	}
+	initDust(cameraY);
+	int lastWrapCount = wrapCount;
 
 	// Instructions for the user
 	std::cout << "Mouse: look around, mouse wheel: field of view" << std::endl;
-	std::cout << "W A S D: walk, Shift: run" << std::endl;
-	std::cout << "F: flashlight, T: textures, H: shadows, G: fog, B: random flicker" << std::endl;
-	std::cout << "R: back to the start, Esc: exit" << std::endl;
+	std::cout << "W A S D: walk, Shift: run, R: back to the start, Esc: exit" << std::endl;
+	std::cout << "F: flashlight, [ ]: cone angle, - =: flashlight brightness" << std::endl;
+	std::cout << "H: shadows, P: PCF (hard / 3x3 / 5x5), O: shadow map size, , .: shadow bias" << std::endl;
+	std::cout << "G: fog, 1 2 3: linear / exponential / Gaussian fog, 4: light in the fog" << std::endl;
+	std::cout << "5: dust, M: antialiasing, T: textures, B: random flicker" << std::endl;
+	std::cout << "V: debug view (final / shadow / light / fog), I: print the numbers" << std::endl;
 
 	double lastTime = glfwGetTime();
+	double startTime = lastTime;
 	double fpsTime = lastTime;
 	int frames = 0;
+	long totalFrames = 0;
 	float fps = 0.0f;
 
 	// Main while loop
@@ -1432,6 +1842,7 @@ int main(int argc, char** argv)
 
 		// FPS is counted for half a second and is shown in the title
 		frames++;
+		totalFrames++;
 		if (currentTime - fpsTime >= 0.5)
 		{
 			fps = (float)(frames / (currentTime - fpsTime));
@@ -1439,6 +1850,8 @@ int main(int argc, char** argv)
 			fpsTime = currentTime;
 			updateTitle(fps);
 		}
+		drawCalls = 0;
+		drawnTriangles = 0;
 
 		// Update the player and the lights
 		updatePlayer(seconds);
@@ -1462,11 +1875,12 @@ int main(int argc, char** argv)
 			redLightEventTimer = 4.0f;
 		}
 
-		// SCP face event
+		// SCP face event: the scene gets dark for 1 second and then the light comes back
 		if (!faceEventTriggered && totalDescent >= FACE_DEPTH)
 		{
 			faceEventTriggered = true;
 			faceEventActive = true;
+			faceEventTimer = 2.0f;
 		}
 
 		if (redLightEventTimer > 0.0f)
@@ -1528,38 +1942,26 @@ int main(int argc, char** argv)
 			}
 		}
 
-		// Horror sound starts at 50 meters
+		// Horror sound starts at 48 meters
 		if (!horrorSoundTriggered && totalDescent >= 48.0f)
 		{
 			horrorSoundTriggered = true;
 			playHorrorSound();
 		}
 
-		// Depth-based fog intensity
-		depthFogFactor = clampValue(
-			(totalDescent - 20.0f) / 20.0f,
-			0.0f,
-			1.0f
-		);
-
-		// Depth-based cold lighting
-		float coldLightFactor = clampValue(
-			(totalDescent - 35.0f) / 15.0f,
-			0.0f,
-			1.0f
-		);
+		// Fog and the cold light depend on the depth
+		Atmosphere atmosphere = computeAtmosphere(totalDescent);
 
 		// Emergency red light pulse
 		float redLightFactor = 0.0f;
-
 		if (redLightEventTimer > 0.0f)
 		{
-			redLightFactor = 0.65f + 0.20f * sinf(currentTime * 10.0f);
+			redLightFactor = 0.65f + 0.20f * sinf((float)currentTime * 10.0f);
 		}
 
-		// camera
+		// The camera: yaw and pitch give the direction of the view, the position is the eye of the player
 		Vec3 eye = makeVec(playerX, cameraY, playerZ);
-		Vec3 forward = makeVec(cosf(pitch) * sinf(yaw), sinf(pitch), -cosf(pitch) * cosf(yaw));
+		Vec3 forward = viewDirection();
 		Vec3 right = normalize(cross(forward, makeVec(0.0f, 1.0f, 0.0f)));
 		Vec3 cameraUp = cross(right, forward);
 		float view[16], projection[16];
@@ -1571,29 +1973,59 @@ int main(int argc, char** argv)
 		}
 		perspectiveMatrix(fieldOfView, aspect, 0.05f, 80.0f, projection);
 
-		// flashlight is in the right hand
+		// The flashlight is in the right hand. The hand follows the head with a small delay (sway)
+		flashDirection = normalize(add(flashDirection, scale(subtract(forward, flashDirection), 1.0f - expf(-FLASH_FOLLOW_SPEED * seconds))));
 		Vec3 flashPosition = add(eye, add(scale(right, FLASH_OFFSET_X), scale(cameraUp, FLASH_OFFSET_Y)));
-		float lightView[16], lightProjection[16], lightVP[16];
-		lookAt(flashPosition, add(flashPosition, forward), cameraUp, lightView);
-		perspectiveMatrix(2.0f * FLASH_OUTER_DEG + 4.0f, 1.0f, 0.2f, 30.0f, lightProjection);
-		multiplyMatrices(lightProjection, lightView, lightVP);
 
+		// Light of the current frame. The shadow map is rendered from the flashlight with a perspective projection
+		// that is a little wider than the cone
+		FrameLight frame;
+		float shadowFov = 2.0f * lighting.outerDeg + 4.0f;
+		float lightView[16], lightProjection[16];
+		lookAt(flashPosition, add(flashPosition, flashDirection), cameraUp, lightView);
+		perspectiveMatrix(shadowFov, 1.0f, 0.2f, 30.0f, lightProjection);
+		multiplyMatrices(lightProjection, lightView, frame.lightVP);
+		frame.flashWorldPosition = flashPosition;
+		frame.flashEyePosition = makeVec(FLASH_OFFSET_X, FLASH_OFFSET_Y, 0.0f);
+		frame.flashEyeDirection = normalize(transformDirection(view, flashDirection));
+		frame.flashIntensity = lighting.intensity * flashlight.level;
+		// Deeper in the stairwell the light reaches less far
+		frame.attenuation[0] = 1.0f;
+		frame.attenuation[1] = 0.09f;
+		frame.attenuation[2] = 0.032f * (1.0f + 0.6f * atmosphere.depthFactor);
+		frame.shadowTexelScale = 2.0f * tanf(shadowFov * PI / 360.0f) / (float)lighting.shadowSize;
+		frame.fogDensity = atmosphere.fogDensity;
+		for (int i = 0; i < 3; i++)
+		{
+			frame.fogColor[i] = atmosphere.fogColor[i];
+		}
+
+		// The dust moves with the loop and is simulated only when it is visible
+		if (wrapCount != lastWrapCount)
+		{
+			shiftDust((wrapCount - lastWrapCount) * LOOP_FLOORS * FLOOR_HEIGHT);
+			lastWrapCount = wrapCount;
+		}
+		if (lighting.dustOn)
+		{
+			updateDust(seconds, cameraY);
+		}
 
 		// The floor of the player and the floors around him
 		int baseFloor = (int)floorf(-feetY / FLOOR_HEIGHT);
-		bool shadowActive = useShadow && flashlightOn;
+		bool shadowActive = lighting.shadowsOn && lighting.flashlightOn;
 
 		// Pass 1: the scene is drawn from the flashlight into the shadow map, only the depth is saved
 		glBindVertexArray(VAO);
 		if (shadowActive)
 		{
 			glBindFramebuffer(GL_FRAMEBUFFER, shadowFramebuffer);
-			glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+			glViewport(0, 0, lighting.shadowSize, lighting.shadowSize);
 			glClear(GL_DEPTH_BUFFER_BIT);
 			glEnable(GL_POLYGON_OFFSET_FILL);
 			glPolygonOffset(2.0f, 4.0f);
 			glUseProgram(shadowProgram);
-			glUniformMatrix4fv(glGetUniformLocation(shadowProgram, "uLightVP"), 1, GL_FALSE, lightVP);
+			glUniformMatrix4fv(glGetUniformLocation(shadowProgram, "uLightVP"), 1, GL_FALSE, frame.lightVP);
 			drawFloors(shadowProgram, baseFloor, false);
 			glDisable(GL_POLYGON_OFFSET_FILL);
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1601,18 +2033,26 @@ int main(int argc, char** argv)
 
 		// Pass 2: the scene is drawn from the camera to the screen
 		glViewport(0, 0, windowWidth, windowHeight);
-		glClearColor(clearColor[0], clearColor[1], clearColor[2], 1.0f);
+		if (lighting.multisample)
+		{
+			glEnable(GL_MULTISAMPLE);
+		}
+		else
+		{
+			glDisable(GL_MULTISAMPLE);
+		}
+		glClearColor(powf(atmosphere.fogColor[0], 1.0f / 2.2f), powf(atmosphere.fogColor[1], 1.0f / 2.2f), powf(atmosphere.fogColor[2], 1.0f / 2.2f), 1.0f);
+		if (lighting.debugView != 0)
+		{
+			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		}
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glUseProgram(sceneProgram);
-		glUniform1f(
-			glGetUniformLocation(sceneProgram, "uSceneBrightness"),
-			sceneBrightness
-		);
+		glUniform1f(glGetUniformLocation(sceneProgram, "uSceneBrightness"), sceneBrightness);
 
 		// Matrices
 		glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uView"), 1, GL_FALSE, view);
 		glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uProjection"), 1, GL_FALSE, projection);
-		glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uLightVP"), 1, GL_FALSE, lightVP);
 
 		// Textures: unit 0 = concrete, unit 1 = metal, unit 2 = shadow map
 		glActiveTexture(GL_TEXTURE0);
@@ -1623,44 +2063,18 @@ int main(int argc, char** argv)
 		glBindTexture(GL_TEXTURE_2D, shadowTexture);
 		glUniform1i(glGetUniformLocation(sceneProgram, "uTexConcrete"), 0);
 		glUniform1i(glGetUniformLocation(sceneProgram, "uTexMetal"), 1);
-		glUniform1i(glGetUniformLocation(sceneProgram, "uShadowMap"), 2);
 
-		// Switches
+		// Switches, the flashlight, the shadows and the fog
 		glUniform1i(glGetUniformLocation(sceneProgram, "uUseTexture"), useTexture ? 1 : 0);
-		glUniform1i(glGetUniformLocation(sceneProgram, "uUseShadow"), shadowActive ? 1 : 0);
-		glUniform1i(glGetUniformLocation(sceneProgram, "uUseFog"), useFog ? 1 : 0);
-		glUniform1f(glGetUniformLocation(sceneProgram, "uShadowBias"), 0.0004f);
-		
-		// Depth-based fog
-		float currentFogDensity = 0.20f + 0.15f * depthFogFactor;
-
-		float currentFogColor[3] =
-		{
-			fogColor[0] + 0.015f * depthFogFactor,
-			fogColor[1] + 0.025f * depthFogFactor,
-			fogColor[2] + 0.055f * depthFogFactor
-		};
-
-		glUniform1f(glGetUniformLocation(sceneProgram, "uFogDensity"), currentFogDensity);
-		glUniform3fv(glGetUniformLocation(sceneProgram, "uFogColor"), 1, currentFogColor);
-
-		// Flashlight: in the eye coordinates the camera is at (0, 0, 0) and looks to -z
-		glUniform1i(glGetUniformLocation(sceneProgram, "uFlashlightOn"), flashlightOn ? 1 : 0);
-		glUniform3f(glGetUniformLocation(sceneProgram, "uFlashPosition"), FLASH_OFFSET_X, FLASH_OFFSET_Y, 0.0f);
-		glUniform3f(glGetUniformLocation(sceneProgram, "uFlashDirection"), 0.0f, 0.0f, -1.0f);
-		glUniform1f(glGetUniformLocation(sceneProgram, "uFlashInner"), cosf(FLASH_INNER_DEG * PI / 180.0f));
-		glUniform1f(glGetUniformLocation(sceneProgram, "uFlashOuter"), cosf(FLASH_OUTER_DEG * PI / 180.0f));
-		glUniform1f(glGetUniformLocation(sceneProgram, "uFlashIntensity"), 2.6f * flashlight.level);
+		glUniform1i(glGetUniformLocation(sceneProgram, "uFogScatter"), lighting.fogScatter ? 1 : 0);
+		glUniform1i(glGetUniformLocation(sceneProgram, "uDebugView"), lighting.debugView);
+		uploadLightingUniforms(sceneProgram, frame, shadowActive);
 
 		// The nearest lamps
 		float lampPositions[MAX_LAMPS * 3];
 		float lampColors[MAX_LAMPS * 3];
 		float lampLevels[MAX_LAMPS];
-		int lampCount = selectLamps(
-			baseFloor, eye, view,
-			lampPositions, lampColors, lampLevels,
-			coldLightFactor, redLightFactor
-		);
+		int lampCount = selectLamps(baseFloor, eye, view, lampPositions, lampColors, lampLevels, atmosphere.coldLightFactor, redLightFactor);
 		glUniform1i(glGetUniformLocation(sceneProgram, "uLampCount"), lampCount);
 		if (lampCount > 0)
 		{
@@ -1671,30 +2085,43 @@ int main(int argc, char** argv)
 
 		drawFloors(sceneProgram, baseFloor, true);
 
+		// The dust is drawn after the solid scene: the depth test hides it behind the walls, but it does not write
+		// to the depth buffer. The additive blending adds the light of the particle to the pixel
+		if (lighting.dustOn && lighting.debugView == 0)
+		{
+			glUseProgram(dustProgram);
+			glUniformMatrix4fv(glGetUniformLocation(dustProgram, "uView"), 1, GL_FALSE, view);
+			glUniformMatrix4fv(glGetUniformLocation(dustProgram, "uProjection"), 1, GL_FALSE, projection);
+			glUniform1f(glGetUniformLocation(dustProgram, "uPointScale"), (float)windowHeight / (2.0f * tanf(fieldOfView * PI / 360.0f)));
+			glUniform1f(glGetUniformLocation(dustProgram, "uSceneBrightness"), sceneBrightness);
+			uploadLightingUniforms(dustProgram, frame, shadowActive);
+
+			glBindVertexArray(dustVAO);
+			glBindBuffer(GL_ARRAY_BUFFER, dustVBO);
+			glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(dustData), dustData);
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+			glDepthMask(GL_FALSE);
+			glDrawArrays(GL_POINTS, 0, DUST_COUNT);
+			drawCalls++;
+			glDepthMask(GL_TRUE);
+			glDisable(GL_BLEND);
+			glBindVertexArray(0);
+		}
+
+		// The face of the event
 		float faceAlpha = 1.0f;
-
 		float loopLength = LOOP_FLOORS * FLOOR_HEIGHT;
-
 		float faceLocalY = -FACE_DEPTH + wrapCount * loopLength;
-
-		Vec3 facePosition = makeVec(
-			FACE_X,
-			faceLocalY,
-			FACE_Z
-		);
-
+		Vec3 facePosition = makeVec(FACE_X, faceLocalY, FACE_Z);
 		Vec3 animatedFacePosition = facePosition;
-
 		float faceScale = 1.0f;
 
 		if (faceJumpScareActive)
 		{
 			float t = clampValue(faceAttackProgress, 0.0f, 1.0f);
 
-			animatedFacePosition = add(
-				faceAttackStart,
-				scale(faceAttackDirection, 3.0f * t)
-			);
+			animatedFacePosition = add(faceAttackStart, scale(faceAttackDirection, 3.0f * t));
 
 			faceScale = 1.0f + 1.5f * t;
 
@@ -1725,8 +2152,7 @@ int main(int argc, char** argv)
 		{
 			faceJumpScareTimer -= seconds;
 
-			faceAttackProgress =
-				1.0f - faceJumpScareTimer / FACE_ATTACK_DURATION;
+			faceAttackProgress = 1.0f - faceJumpScareTimer / FACE_ATTACK_DURATION;
 
 			if (faceJumpScareTimer <= 0.0f)
 			{
@@ -1742,19 +2168,8 @@ int main(int argc, char** argv)
 			glDisable(GL_DEPTH_TEST);
 			glDisable(GL_CULL_FACE);
 
-			drawFace(
-				faceProgram,
-				faceVAO,
-				faceVBO,
-				faceTexture,
-				eye,
-				animatedFacePosition,
-				view,
-				projection,
-				2.0f * faceScale,
-				2.4f * faceScale,
-				faceAlpha
-			);
+			drawFace(faceProgram, faceVAO, faceVBO, faceTexture, eye, animatedFacePosition, view, projection,
+				2.0f * faceScale, 2.4f * faceScale, faceAlpha);
 
 			glEnable(GL_CULL_FACE);
 			glEnable(GL_DEPTH_TEST);
@@ -1766,15 +2181,28 @@ int main(int argc, char** argv)
 		glfwPollEvents();
 	}
 
+	// The average FPS of the whole run (for the report)
+	double totalSeconds = glfwGetTime() - startTime;
+	if (totalSeconds > 0.0)
+	{
+		std::cout << "Average FPS: " << totalFrames / totalSeconds << " (" << totalFrames << " frames)" << std::endl;
+	}
+
 	// Delete all the objects we've created
 	glDeleteVertexArrays(1, &VAO);
 	glDeleteBuffers(1, &VBO);
+	glDeleteVertexArrays(1, &dustVAO);
+	glDeleteBuffers(1, &dustVBO);
+	glDeleteVertexArrays(1, &faceVAO);
+	glDeleteBuffers(1, &faceVBO);
 	glDeleteTextures(1, &concreteTexture);
 	glDeleteTextures(1, &metalTexture);
 	glDeleteTextures(1, &shadowTexture);
 	glDeleteFramebuffers(1, &shadowFramebuffer);
 	glDeleteProgram(sceneProgram);
 	glDeleteProgram(shadowProgram);
+	glDeleteProgram(dustProgram);
+	glDeleteProgram(faceProgram);
 	glfwDestroyWindow(window);
 	glfwTerminate();
 	return 0;
